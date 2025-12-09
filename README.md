@@ -24,6 +24,7 @@ python3 main.py https://example.com --http-backend curl
 PostgreSQLCrawler_DB_BACKEND=postgresql PostgreSQLCrawler_POSTGRES_HOST=localhost PostgreSQLCrawler_POSTGRES_DB=crawler_db PostgreSQLCrawler_POSTGRES_USER=sql_crawler PostgreSQLCrawler_POSTGRES_PASSWORD=bad_password venv/bin/python main.py https://whiskipedia.com   --max-workers 15   --concurrency 20 --skip-sitemaps
 ```
 
+If using a venv
 ```bash
 # Basic crawl
 venv/bin/python main.py https://whiskipedia.com
@@ -40,19 +41,6 @@ venv/bin/python main.py https://whiskipedia.com --compare-domain https://staging
 # To use curl_cffi like in the benchmarks:
 venv/bin/python main.py https://whiskipedia.com --http-backend curl
 ```
-
-
-
-
-## 📊 Performance
-
-PostgreSQLCrawler uses optimized settings for maximum performance:
-- **Parallel database operations** for faster I/O
-- **Optimized batch sizes** (100/500/1000/100) for better throughput
-- **Intelligent retry logic** with exponential backoff
-- **7.1% faster** than baseline configuration
-
-See [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) for detailed benchmark results.
 
 ## ✨ Key Features
 
@@ -83,19 +71,44 @@ See [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) for detailed benchmark re
 
 ## 🛠️ Installation
 
+### **Setting Up Virtual Environment**
+
+It's recommended to use a virtual environment to isolate dependencies:
+
 ```bash
 # Clone the repository
 git clone https://github.com/user256/PostgreSQLCrawler.git
 cd PostgreSQLCrawler
 
 # Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python3 -m venv venv
 
-# Install dependencies
+# Activate virtual environment
+# On Linux/macOS:
+source venv/bin/activate
+
+# On Windows:
+# venv\Scripts\activate
+
+# Upgrade pip (recommended)
+pip install --upgrade pip
+
+# Install dependencies from requirements.txt
+pip install -r requirements.txt
+
+# Optional: Install JavaScript rendering support (Playwright)
+pip install playwright>=1.48
+playwright install
+```
+
+**Note:** After activating the virtual environment, you'll see `(venv)` in your terminal prompt. All Python commands should be run with the venv activated.
+
+**Alternative installation using pyproject.toml:**
+```bash
+# Install as editable package
 pip install -e .
 
-# Optional: Install JavaScript rendering support
+# With JavaScript support:
 pip install -e .[js]
 playwright install
 ```
