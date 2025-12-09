@@ -434,24 +434,13 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
             print(f"Writing {len(hreflang_data_to_write)} hreflang entries to database...")
             await batch_write_hreflang_sitemap_data(hreflang_data_to_write, crawl_db_path, base_domain)
         
-        # Add sitemap URLs to frontier - AFTER start URL
-        # Only add URLs that are not already in frontier (frontier_seed will skip 'done' URLs)
-        sitemap_urls_list = list(sitemap_urls_dict.keys())
-        if limits.max_pages > 0:
-            sitemap_urls_list = sitemap_urls_list[:limits.max_pages]
-        
-        added_count = 0
-        for url in sitemap_urls_list:
-            url_norm = normalize_url_for_storage(url)
-            sitemap_data = sitemap_urls_dict.get(url, {})
-            sitemap_priority = sitemap_data.get('priority')
-            # frontier_seed will skip URLs that are already 'done'
-            result = await frontier_seed(url_norm, base_domain, reset=False, config=db_config, 
-                                      sitemap_priority=sitemap_priority, depth=0)
-            if result:
-                added_count += 1
-        
-        print(f"Added {added_count} URLs from sitemaps to frontier")
+        # Note: We do NOT seed sitemap URLs directly to the frontier
+        # Sitemap URLs are stored in the database for reference/prioritization,
+        # but they will only be added to the frontier when discovered through
+        # actual link following from the seed page. This ensures crawl_depth
+        # accurately reflects the distance from the seed page (number of clicks).
+        # Sitemap priority will still be used when URLs are discovered naturally.
+        print(f"Stored {len(sitemap_urls_dict)} URLs from sitemaps (will be crawled when discovered via links from seed)")
         
         # Backfill any URLs that are in urls table but not in frontier (unknown status)
         await backfill_missing_frontier_entries(base_domain, db_config)

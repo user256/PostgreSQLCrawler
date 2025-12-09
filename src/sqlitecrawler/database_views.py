@@ -385,29 +385,96 @@ FROM content;
 
 # PostgreSQL database views (simplified versions)
 POSTGRES_DATABASE_VIEWS = """
--- Main crawl overview view (PostgreSQL version)
+-- Main crawl overview view (PostgreSQL version) - aligned with SQLite fields
 CREATE OR REPLACE VIEW view_crawl_overview AS
 SELECT 
     u.url,
     COALESCE(f.status, 'unknown') as crawl_status,
     pm.initial_status_code as status_code,
     i.overall_indexable as indexable,
+    CASE 
+        WHEN i.overall_indexable = FALSE THEN
+            CASE 
+                WHEN i.robots_txt_allows = FALSE THEN 'blocked by robots.txt'
+                WHEN i.html_meta_allows = FALSE THEN 'blocked by meta robots'
+                WHEN i.http_header_allows = FALSE THEN 'blocked by HTTP headers'
+                WHEN pm.initial_status_code != 200 THEN 'not 200 status'
+                WHEN EXISTS (
+                    SELECT 1 FROM canonical_urls cu_check 
+                    JOIN urls canonical_urls_table_check ON cu_check.canonical_url_id = canonical_urls_table_check.id 
+                    WHERE cu_check.url_id = u.id AND canonical_urls_table_check.url != u.url
+                ) THEN 'not self canonical'
+                ELSE 'unknown reason'
+            END
+        ELSE NULL
+    END as indexability_reason,
     u.kind as type,
     u.classification,
     c.title,
     md.description as meta_description,
+    -- h1 tags: first and second, plus count
+    (SELECT elem FROM jsonb_array_elements_text(COALESCE(NULLIF(c.h1_tags, ''), '[]')::jsonb) WITH ORDINALITY t(elem, ord) WHERE btrim(elem) <> '' ORDER BY ord LIMIT 1) as h1_1,
+    (SELECT elem FROM jsonb_array_elements_text(COALESCE(NULLIF(c.h1_tags, ''), '[]')::jsonb) WITH ORDINALITY t(elem, ord) WHERE btrim(elem) <> '' ORDER BY ord OFFSET 1 LIMIT 1) as h1_2,
+    (SELECT COUNT(*) FROM jsonb_array_elements_text(COALESCE(NULLIF(c.h1_tags, ''), '[]')::jsonb) AS t(elem) WHERE btrim(elem) <> '') as h1_count,
+    -- h2 tags collapsed and counted
+    (SELECT string_agg(btrim(elem), ', ') FROM jsonb_array_elements_text(COALESCE(NULLIF(c.h2_tags, ''), '[]')::jsonb) AS t(elem) WHERE btrim(elem) <> '') as h2_tags,
+    (SELECT COUNT(*) FROM jsonb_array_elements_text(COALESCE(NULLIF(c.h2_tags, ''), '[]')::jsonb) AS t(elem) WHERE btrim(elem) <> '') as h2_count,
     c.word_count,
     hl.language_code as html_lang,
     c.internal_links_count,
     c.external_links_count,
+    c.internal_links_unique_count,
+    c.external_links_unique_count,
     c.crawl_depth,
     c.inlinks_count,
+    c.inlinks_unique_count,
     i.robots_txt_allows,
     i.html_meta_allows,
     i.http_header_allows,
+    COALESCE(i.robots_txt_directives, '') as robots_txt_directives,
+    COALESCE(i.html_meta_directives, '') as html_meta_directives,
+    COALESCE(i.http_header_directives, '') as http_header_directives,
+    (SELECT array_agg(DISTINCT canonical_urls_table.url) FROM canonical_urls cu_agg JOIN urls canonical_urls_table ON cu_agg.canonical_url_id = canonical_urls_table.id WHERE cu_agg.url_id = u.id) as canonical_urls,
+    (SELECT array_agg(DISTINCT cu_agg.source) FROM canonical_urls cu_agg WHERE cu_agg.url_id = u.id) as canonical_sources,
+    redirect_dest.url as redirect_destination_url,
+    -- Find the hreflang language that points to this page itself (excluding x-default)
+    (SELECT hl_self.language_code 
+     FROM hreflang_html_head hs_self 
+     JOIN hreflang_languages hl_self ON hs_self.hreflang_id = hl_self.id 
+     JOIN urls href_self ON hs_self.href_url_id = href_self.id 
+     WHERE hs_self.url_id = u.id 
+       AND href_self.url = u.url 
+       AND hl_self.language_code != 'x-default'
+     LIMIT 1) as self_hreflang_language,
+    -- Count total hreflang entries for this page
+    (SELECT COUNT(*) 
+     FROM hreflang_html_head hs_count 
+     WHERE hs_count.url_id = u.id) as hreflang_count,
+    -- Get the x-default hreflang URL if it exists
+    (SELECT href_xdefault.url 
+     FROM hreflang_html_head hs_xdefault 
+     JOIN hreflang_languages hl_xdefault ON hs_xdefault.hreflang_id = hl_xdefault.id 
+     JOIN urls href_xdefault ON hs_xdefault.href_url_id = href_xdefault.id 
+     WHERE hs_xdefault.url_id = u.id 
+       AND hl_xdefault.language_code = 'x-default'
+     LIMIT 1) as x_default_hreflang_url,
+    -- Schema data summary
+    (SELECT array_agg(DISTINCT st.type_name) 
+     FROM page_schema_references psr 
+     JOIN schema_instances si ON psr.schema_instance_id = si.id 
+     JOIN schema_types st ON si.schema_type_id = st.id 
+     WHERE psr.url_id = u.id AND psr.is_main_entity = TRUE) as main_schema_types,
+    (SELECT COUNT(*) 
+     FROM page_schema_references psr 
+     WHERE psr.url_id = u.id AND psr.is_main_entity = TRUE) as main_schema_count,
+    (SELECT COUNT(*) 
+     FROM page_schema_references psr 
+     WHERE psr.url_id = u.id) as total_schema_count,
+    -- Content hash information
     c.content_hash_sha256,
     c.content_hash_simhash,
     c.content_length,
+    -- Timestamps
     u.first_seen,
     u.last_seen,
     pm.fetched_at,
@@ -420,8 +487,10 @@ LEFT JOIN meta_descriptions md ON c.meta_description_id = md.id
 LEFT JOIN html_languages hl ON c.html_lang_id = hl.id
 LEFT JOIN page_metadata pm ON u.id = pm.url_id
 LEFT JOIN indexability i ON u.id = i.url_id
+LEFT JOIN urls redirect_dest ON pm.redirect_destination_url_id = redirect_dest.id
 WHERE u.classification IN ('internal', 'network')
-  AND u.url NOT LIKE '%#%';
+  AND u.url NOT LIKE '%#%'
+GROUP BY u.id, f.status, pm.initial_status_code, i.overall_indexable, u.kind, u.classification, c.title, md.description, c.h1_tags, c.h2_tags, c.word_count, hl.language_code, c.internal_links_count, c.external_links_count, c.internal_links_unique_count, c.external_links_unique_count, c.crawl_depth, c.inlinks_count, c.inlinks_unique_count, i.robots_txt_allows, i.html_meta_allows, i.http_header_allows, i.robots_txt_directives, i.html_meta_directives, i.http_header_directives, redirect_dest.url, c.content_hash_sha256, c.content_hash_simhash, c.content_length, u.first_seen, u.last_seen, pm.fetched_at, f.enqueued_at, f.updated_at;
 
 -- Internal links view (PostgreSQL version)
 CREATE OR REPLACE VIEW view_links_internal AS

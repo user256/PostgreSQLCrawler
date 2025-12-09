@@ -2301,25 +2301,56 @@ async def batch_write_internal_links(links_data: List[Dict], crawl_db_path: str 
             # Batch resolve all URL IDs at once
             url_to_id_map = await batch_get_or_create_url_ids(urls_to_resolve, base_domain, config, conn)
             
-            # Prepare batch data
+            # Prepare batch data and track link counts per source URL
             batch_data = []
             current_time = int(time.time())
+            # Track link counts per source_url_id: {source_url_id: {'internal': count, 'external': count, 'internal_unique': set, 'external_unique': set}}
+            link_counts = {}
+            
+            from .db import classify_url
             
             for link_tuple in links_data:
                 # link_tuple format: (original_norm, detailed_links, base_domain)
                 original_norm, detailed_links, base_domain = link_tuple
                 
+                # Get source URL ID
+                source_url_id = url_to_id_map.get(original_norm, 0)
+                if not source_url_id:
+                    continue
+                
+                # Initialize counts for this source URL
+                if source_url_id not in link_counts:
+                    link_counts[source_url_id] = {
+                        'internal': 0,
+                        'external': 0,
+                        'internal_unique': set(),
+                        'external_unique': set()
+                    }
+                
                 # Process each detailed link
                 for link_item in detailed_links:
                     # Get URL IDs from the map
-                    source_url_id = url_to_id_map.get(original_norm, 0)
                     target_url_id = url_to_id_map.get(link_item['url']) if link_item.get('url') else None
                     # Use normalized original_href to get href_url_id (matches what we added to urls_to_resolve)
                     normalized_original_href = normalize_url_hardened(link_item['original_href'])
                     href_url_id = url_to_id_map.get(normalized_original_href, 0)
                     
-                    if not source_url_id or not href_url_id:
+                    if not href_url_id:
                         continue  # Skip if essential IDs not found
+                    
+                    # Get target URL for classification
+                    target_url = link_item.get('url')
+                    if target_url:
+                        # Classify the link using normalized URL
+                        classification = classify_url(target_url, base_domain)
+                        
+                        # Count internal vs external for statistics
+                        if classification == 'internal':
+                            link_counts[source_url_id]['internal'] += 1
+                            link_counts[source_url_id]['internal_unique'].add(target_url)
+                        else:
+                            link_counts[source_url_id]['external'] += 1
+                            link_counts[source_url_id]['external_unique'].add(target_url)
                     
                     # Get or create anchor text ID if provided (still individual, but less frequent)
                     anchor_text_id = None
@@ -2353,6 +2384,25 @@ async def batch_write_internal_links(links_data: List[Dict], crawl_db_path: str 
                 for i in range(0, len(batch_data), chunk_size):
                     chunk = batch_data[i:i + chunk_size]
                     await conn.executemany(query, chunk)
+            
+            # Update content table with link counts
+            if link_counts:
+                for source_url_id, counts in link_counts.items():
+                    await conn.execute(
+                        """
+                        UPDATE content 
+                        SET internal_links_count = $1, 
+                            external_links_count = $2,
+                            internal_links_unique_count = $3,
+                            external_links_unique_count = $4
+                        WHERE url_id = $5
+                        """,
+                        counts['internal'],
+                        counts['external'],
+                        len(counts['internal_unique']),
+                        len(counts['external_unique']),
+                        source_url_id
+                    )
     else:
         # For SQLite, use the original implementation with the correct database path
         from .db import batch_write_internal_links as sqlite_batch_write_internal_links
@@ -2660,11 +2710,15 @@ async def backfill_missing_frontier_entries(base_domain: str, config: DatabaseCo
             # Also get their classification and kind to help debug why they weren't enqueued
             query = """
                 SELECT u.id, u.url, u.classification, u.kind, 
-                       CASE WHEN cu.url_id IS NOT NULL THEN 'canonical' ELSE '' END as is_canonical,
-                       CASE WHEN hh.url_id IS NOT NULL THEN 'hreflang' ELSE '' END as is_hreflang
+                       CASE WHEN cu.canonical_url_id = u.id THEN TRUE ELSE FALSE END as is_canonical_target,
+                       CASE WHEN hh.href_url_id = u.id THEN TRUE ELSE FALSE END as is_hreflang_target,
+                       CASE WHEN r_source.source_url_id = u.id THEN TRUE ELSE FALSE END as is_redirect_source,
+                       CASE WHEN r_target.target_url_id = u.id THEN TRUE ELSE FALSE END as is_redirect_target
                 FROM urls u
                 LEFT JOIN canonical_urls cu ON u.id = cu.canonical_url_id
                 LEFT JOIN hreflang_html_head hh ON u.id = hh.href_url_id
+                LEFT JOIN redirects r_source ON u.id = r_source.source_url_id
+                LEFT JOIN redirects r_target ON u.id = r_target.target_url_id
                 WHERE u.classification IN ('internal', 'network')
                   AND u.id NOT IN (SELECT url_id FROM frontier)
                 ORDER BY u.id
