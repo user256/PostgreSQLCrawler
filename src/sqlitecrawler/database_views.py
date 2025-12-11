@@ -159,24 +159,42 @@ GROUP BY u.id;
 
 -- Internal links view
 CREATE VIEW IF NOT EXISTS view_links_internal AS
-SELECT 
+SELECT DISTINCT
     source.url as source_url,
     target.url as target_url,
     at.text as anchor_text,
     x.xpath,
     f.fragment,
     il.url_parameters,
-    il.discovered_at,
+    MIN(il.discovered_at) as discovered_at,
     CASE WHEN at.text IS NULL THEN 1 ELSE 0 END as is_image,
     CASE WHEN f.fragment IS NOT NULL THEN 1 ELSE 0 END as has_fragment,
-    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters
+    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters,
+    COALESCE(
+        pm.initial_status_code,
+        (SELECT pm_redirect.initial_status_code FROM page_metadata pm_redirect WHERE pm_redirect.final_url_id = target.id LIMIT 1)
+    ) as target_status_code,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM canonical_urls cu 
+            JOIN urls canonical_target ON cu.canonical_url_id = canonical_target.id 
+            WHERE cu.url_id = target.id AND canonical_target.url = target.url
+        ) THEN 1 
+        ELSE 0 
+    END as target_is_self_canonical,
+    CASE 
+        WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        ELSE 0
+    END as target_resolves
 FROM internal_links il
 JOIN urls source ON il.source_url_id = source.id
 LEFT JOIN urls target ON il.target_url_id = target.id
 LEFT JOIN anchor_texts at ON il.anchor_text_id = at.id
 LEFT JOIN xpaths x ON il.xpath_id = x.id
 LEFT JOIN fragments f ON il.fragment_id = f.id
-WHERE source.classification = 'internal' AND (target.classification = 'internal' OR target.classification IS NULL);
+LEFT JOIN page_metadata pm ON target.id = pm.url_id
+WHERE source.classification = 'internal' AND (target.classification = 'internal' OR target.classification IS NULL)
+GROUP BY source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters, target_status_code, target_resolves;
 
 -- Network links view
 CREATE VIEW IF NOT EXISTS view_links_network AS
@@ -201,24 +219,94 @@ WHERE source.classification = 'internal' AND target.classification = 'network';
 
 -- External links view
 CREATE VIEW IF NOT EXISTS view_links_external AS
-SELECT 
+SELECT DISTINCT
     source.url as source_url,
     target.url as target_url,
     at.text as anchor_text,
     x.xpath,
     f.fragment,
     il.url_parameters,
-    il.discovered_at,
+    MIN(il.discovered_at) as discovered_at,
     CASE WHEN at.text IS NULL THEN 1 ELSE 0 END as is_image,
     CASE WHEN f.fragment IS NOT NULL THEN 1 ELSE 0 END as has_fragment,
-    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters
+    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters,
+    COALESCE(
+        pm.initial_status_code,
+        (SELECT pm_redirect.initial_status_code FROM page_metadata pm_redirect WHERE pm_redirect.final_url_id = target.id LIMIT 1)
+    ) as target_status_code,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM canonical_urls cu 
+            JOIN urls canonical_target ON cu.canonical_url_id = canonical_target.id 
+            WHERE cu.url_id = target.id AND canonical_target.url = target.url
+        ) THEN 1 
+        ELSE 0 
+    END as target_is_self_canonical,
+    CASE 
+        WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        ELSE 0
+    END as target_resolves
 FROM internal_links il
 JOIN urls source ON il.source_url_id = source.id
 LEFT JOIN urls target ON il.target_url_id = target.id
 LEFT JOIN anchor_texts at ON il.anchor_text_id = at.id
 LEFT JOIN xpaths x ON il.xpath_id = x.id
 LEFT JOIN fragments f ON il.fragment_id = f.id
-WHERE source.classification = 'internal' AND target.classification = 'external';
+LEFT JOIN page_metadata pm ON target.id = pm.url_id
+WHERE source.classification = 'internal' AND target.classification = 'external'
+GROUP BY source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters, target_status_code, target_resolves;
+
+-- Invalid content links view (redirects, non-canonical, or non-200 status)
+CREATE VIEW IF NOT EXISTS view_links_invalid_content AS
+SELECT 
+    source_url,
+    target_url,
+    anchor_text,
+    xpath,
+    fragment,
+    url_parameters,
+    discovered_at,
+    is_image,
+    has_fragment,
+    has_parameters,
+    target_status_code,
+    target_is_self_canonical,
+    target_resolves,
+    CASE 
+        WHEN target_resolves = 0 THEN 'redirects'
+        WHEN target_is_self_canonical = 0 THEN 'not self-canonical'
+        WHEN target_status_code IS NOT NULL AND target_status_code != 200 THEN 'non-200 status'
+        ELSE 'unknown issue'
+    END as invalid_reason
+FROM view_links_internal
+WHERE target_resolves = 0 
+   OR target_is_self_canonical = 0 
+   OR (target_status_code IS NOT NULL AND target_status_code != 200)
+UNION ALL
+SELECT 
+    source_url,
+    target_url,
+    anchor_text,
+    xpath,
+    fragment,
+    url_parameters,
+    discovered_at,
+    is_image,
+    has_fragment,
+    has_parameters,
+    target_status_code,
+    target_is_self_canonical,
+    target_resolves,
+    CASE 
+        WHEN target_resolves = 0 THEN 'redirects'
+        WHEN target_is_self_canonical = 0 THEN 'not self-canonical'
+        WHEN target_status_code IS NOT NULL AND target_status_code != 200 THEN 'non-200 status'
+        ELSE 'unknown issue'
+    END as invalid_reason
+FROM view_links_external
+WHERE target_resolves = 0 
+   OR target_is_self_canonical = 0 
+   OR (target_status_code IS NOT NULL AND target_status_code != 200);
 
 -- Subdomain links view
 CREATE VIEW IF NOT EXISTS view_links_subdomain AS
@@ -494,7 +582,7 @@ GROUP BY u.id, f.status, pm.initial_status_code, i.overall_indexable, u.kind, u.
 
 -- Internal links view (PostgreSQL version)
 CREATE OR REPLACE VIEW view_links_internal AS
-SELECT 
+SELECT DISTINCT ON (source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters)
     source.url as source_url,
     target.url as target_url,
     at.text as anchor_text,
@@ -504,18 +592,36 @@ SELECT
     il.discovered_at,
     CASE WHEN at.text IS NULL THEN 1 ELSE 0 END as is_image,
     CASE WHEN f.fragment IS NOT NULL THEN 1 ELSE 0 END as has_fragment,
-    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters
+    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters,
+    COALESCE(
+        pm.initial_status_code,
+        (SELECT pm_redirect.initial_status_code FROM page_metadata pm_redirect WHERE pm_redirect.final_url_id = target.id LIMIT 1)
+    ) as target_status_code,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM canonical_urls cu 
+            JOIN urls canonical_target ON cu.canonical_url_id = canonical_target.id 
+            WHERE cu.url_id = target.id AND canonical_target.url = target.url
+        ) THEN 1 
+        ELSE 0 
+    END as target_is_self_canonical,
+    CASE 
+        WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        ELSE 0
+    END as target_resolves
 FROM internal_links il
 JOIN urls source ON il.source_url_id = source.id
 LEFT JOIN urls target ON il.target_url_id = target.id
 LEFT JOIN anchor_texts at ON il.anchor_text_id = at.id
 LEFT JOIN xpaths x ON il.xpath_id = x.id
 LEFT JOIN fragments f ON il.fragment_id = f.id
-WHERE source.classification = 'internal' AND (target.classification = 'internal' OR target.classification IS NULL);
+LEFT JOIN page_metadata pm ON target.id = pm.url_id
+WHERE source.classification = 'internal' AND (target.classification = 'internal' OR target.classification IS NULL)
+ORDER BY source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters, il.discovered_at;
 
 -- External links view (PostgreSQL version)
 CREATE OR REPLACE VIEW view_links_external AS
-SELECT 
+SELECT DISTINCT ON (source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters)
     source.url as source_url,
     target.url as target_url,
     at.text as anchor_text,
@@ -525,14 +631,84 @@ SELECT
     il.discovered_at,
     CASE WHEN at.text IS NULL THEN 1 ELSE 0 END as is_image,
     CASE WHEN f.fragment IS NOT NULL THEN 1 ELSE 0 END as has_fragment,
-    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters
+    CASE WHEN il.url_parameters IS NOT NULL THEN 1 ELSE 0 END as has_parameters,
+    COALESCE(
+        pm.initial_status_code,
+        (SELECT pm_redirect.initial_status_code FROM page_metadata pm_redirect WHERE pm_redirect.final_url_id = target.id LIMIT 1)
+    ) as target_status_code,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM canonical_urls cu 
+            JOIN urls canonical_target ON cu.canonical_url_id = canonical_target.id 
+            WHERE cu.url_id = target.id AND canonical_target.url = target.url
+        ) THEN 1 
+        ELSE 0 
+    END as target_is_self_canonical,
+    CASE 
+        WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        ELSE 0
+    END as target_resolves
 FROM internal_links il
 JOIN urls source ON il.source_url_id = source.id
 LEFT JOIN urls target ON il.target_url_id = target.id
 LEFT JOIN anchor_texts at ON il.anchor_text_id = at.id
 LEFT JOIN xpaths x ON il.xpath_id = x.id
 LEFT JOIN fragments f ON il.fragment_id = f.id
-WHERE source.classification = 'internal' AND target.classification = 'external';
+LEFT JOIN page_metadata pm ON target.id = pm.url_id
+WHERE source.classification = 'internal' AND target.classification = 'external'
+ORDER BY source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters, il.discovered_at;
+
+-- Invalid content links view (PostgreSQL version) - redirects, non-canonical, or non-200 status
+CREATE OR REPLACE VIEW view_links_invalid_content AS
+SELECT 
+    source_url,
+    target_url,
+    anchor_text,
+    xpath,
+    fragment,
+    url_parameters,
+    discovered_at,
+    is_image,
+    has_fragment,
+    has_parameters,
+    target_status_code,
+    target_is_self_canonical,
+    target_resolves,
+    CASE 
+        WHEN target_resolves = 0 THEN 'redirects'
+        WHEN target_is_self_canonical = 0 THEN 'not self-canonical'
+        WHEN target_status_code IS NOT NULL AND target_status_code != 200 THEN 'non-200 status'
+        ELSE 'unknown issue'
+    END as invalid_reason
+FROM view_links_internal
+WHERE target_resolves = 0 
+   OR target_is_self_canonical = 0 
+   OR (target_status_code IS NOT NULL AND target_status_code != 200)
+UNION ALL
+SELECT 
+    source_url,
+    target_url,
+    anchor_text,
+    xpath,
+    fragment,
+    url_parameters,
+    discovered_at,
+    is_image,
+    has_fragment,
+    has_parameters,
+    target_status_code,
+    target_is_self_canonical,
+    target_resolves,
+    CASE 
+        WHEN target_resolves = 0 THEN 'redirects'
+        WHEN target_is_self_canonical = 0 THEN 'not self-canonical'
+        WHEN target_status_code IS NOT NULL AND target_status_code != 200 THEN 'non-200 status'
+        ELSE 'unknown issue'
+    END as invalid_reason
+FROM view_links_external
+WHERE target_resolves = 0 
+   OR target_is_self_canonical = 0 
+   OR (target_status_code IS NOT NULL AND target_status_code != 200);
 
 -- Schema analysis view (PostgreSQL version)
 CREATE OR REPLACE VIEW view_schema_analysis AS

@@ -295,7 +295,7 @@ CREATE TABLE IF NOT EXISTS internal_links (
   FOREIGN KEY (xpath_id) REFERENCES xpaths (id),
   FOREIGN KEY (href_url_id) REFERENCES urls (id),
   FOREIGN KEY (fragment_id) REFERENCES fragments (id),
-  UNIQUE(source_url_id, xpath_id)  -- Prevent duplicate links with same xpath
+  UNIQUE(source_url_id, target_url_id, anchor_text_id, xpath_id, fragment_id, url_parameters)  -- Prevent duplicate links
 );
 CREATE INDEX IF NOT EXISTS idx_internal_links_source ON internal_links(source_url_id);
 CREATE INDEX IF NOT EXISTS idx_internal_links_target ON internal_links(target_url_id);
@@ -448,6 +448,7 @@ CREATE TABLE IF NOT EXISTS frontier (
   sitemap_priority REAL DEFAULT 0.5,
   inlinks_count INTEGER DEFAULT 0,
   content_type_score REAL DEFAULT 1.0,
+  reset_count INTEGER DEFAULT 0,
   FOREIGN KEY (url_id) REFERENCES urls (id),
   FOREIGN KEY (parent_id) REFERENCES urls (id),
   UNIQUE(url_id)
@@ -1883,6 +1884,9 @@ async def batch_write_internal_links(links_data: List[Tuple[str, list, str]], cr
                     internal_unique = set()
                     external_unique = set()
                     
+                    # Track seen links to prevent duplicates within this batch
+                    seen_links = set()
+                    
                     for link_info in detailed_links:
                         # Get both normalized and original URLs
                         target_url = link_info['url']  # Normalized URL for crawling
@@ -1911,6 +1915,22 @@ async def batch_write_internal_links(links_data: List[Tuple[str, list, str]], cr
                             row = await cursor.fetchone()
                             if row:
                                 target_url_id = row[0]
+                        
+                        # Create a unique key for this link to prevent duplicates within this batch
+                        link_key = (
+                            source_url_id,
+                            target_url_id,
+                            anchor_text_id,
+                            xpath_id,
+                            href_url_id,
+                            fragment_id,
+                            link_info.get('parameters', url_components['url_parameters'])
+                        )
+                        
+                        # Skip if we've already seen this exact link in this batch
+                        if link_key in seen_links:
+                            continue
+                        seen_links.add(link_key)
                         
                         # Classify the link using normalized URL
                         classification = classify_url(target_url, base_domain)

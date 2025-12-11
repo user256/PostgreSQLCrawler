@@ -1,18 +1,131 @@
 """
 Crawl comparison functionality for comparing origin and staging domains.
+Supports both SQLite and PostgreSQL database backends.
 """
 import asyncio
 import aiosqlite
 import time
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import csv
 import os
 
 from .crawl import crawl
-from .config import CrawlLimits, HttpConfig, get_db_paths
+from .config import CrawlLimits, HttpConfig, get_db_paths, get_database_config, get_website_db_name
 from .db import init_pages_db, init_crawl_db
+from .database import DatabaseConfig, DatabaseConnection, DatabaseFactory, create_connection, set_global_config
+
+
+def detect_database_backend(db_path_or_name: str) -> str:
+    """Detect if a database path/name is SQLite or PostgreSQL.
+    
+    Args:
+        db_path_or_name: Database file path (SQLite) or database name (PostgreSQL)
+    
+    Returns:
+        'sqlite' or 'postgresql'
+    """
+    # Check if it's a file path (SQLite) or database name (PostgreSQL)
+    if os.path.exists(db_path_or_name) or db_path_or_name.endswith('.db'):
+        return 'sqlite'
+    
+    # Check environment variables to determine backend
+    import os as os_module
+    backend = os_module.getenv("PostgreSQLCrawler_DB_BACKEND") or os_module.getenv("SQLITECRAWLER_DB_BACKEND", "sqlite")
+    return backend
+
+
+class ConfigRestoringContextManager:
+    """Context manager wrapper that restores global config after use."""
+    
+    def __init__(self, inner_context, old_config):
+        self.inner_context = inner_context
+        self.old_config = old_config
+    
+    async def __aenter__(self):
+        from .database import set_global_config
+        conn = await self.inner_context.__aenter__()
+        return conn
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        from .database import set_global_config
+        result = await self.inner_context.__aexit__(exc_type, exc_val, exc_tb)
+        # Restore old config after context exits
+        if self.old_config:
+            set_global_config(self.old_config)
+        return result
+
+
+def get_crawl_db_connection(db_path_or_name: str, origin_url: str = None):
+    """Get a database connection context manager for reading crawl data.
+    
+    Args:
+        db_path_or_name: Database file path (SQLite) or database name (PostgreSQL)
+        origin_url: Original URL used for the crawl (to determine PostgreSQL database name)
+    
+    Returns:
+        Context manager that yields DatabaseConnection instance
+    """
+    backend = detect_database_backend(db_path_or_name)
+    
+    if backend == "postgresql":
+        # For PostgreSQL, we need to construct the config
+        # The db_path_or_name might be a database name or we need to derive it from origin_url
+        if origin_url:
+            website_name = get_website_db_name(origin_url)
+            database_name = f"{website_name}_crawler"
+        else:
+            # Try to extract from db_path_or_name if it's a database name
+            database_name = db_path_or_name if not db_path_or_name.endswith('.db') else "crawler_db"
+        
+        config = get_database_config(origin_url) if origin_url else get_database_config()
+        if config.backend != "postgresql":
+            # Override to use PostgreSQL
+            from .database import DatabaseConfig
+            import os as os_module
+            config = DatabaseConfig(
+                backend="postgresql",
+                postgres_host=os_module.getenv("PostgreSQLCrawler_POSTGRES_HOST", "localhost"),
+                postgres_port=int(os_module.getenv("PostgreSQLCrawler_POSTGRES_PORT", "5432")),
+                postgres_database=database_name,
+                postgres_user=os_module.getenv("PostgreSQLCrawler_POSTGRES_USER", "crawler_user"),
+                postgres_password=os_module.getenv("PostgreSQLCrawler_POSTGRES_PASSWORD", ""),
+                postgres_schema="public"
+            )
+        
+        # Set global config temporarily for connection creation
+        from .database import get_global_config, set_global_config, create_connection
+        old_config = get_global_config()
+        set_global_config(config)
+        # Return a wrapper that restores config after use
+        return ConfigRestoringContextManager(create_connection(), old_config)
+    else:
+        # SQLite - use file path directly
+        from .database import SQLiteConnection
+        return SQLiteConnection(db_path_or_name)
+
+
+def adapt_query_for_backend(query: str, backend: str) -> str:
+    """Adapt SQL query parameters for the database backend.
+    
+    SQLite uses ? placeholders, PostgreSQL uses $1, $2, etc.
+    
+    Args:
+        query: SQL query with ? placeholders
+        backend: 'sqlite' or 'postgresql'
+    
+    Returns:
+        Adapted query string
+    """
+    if backend == "postgresql":
+        # Convert ? placeholders to $1, $2, etc.
+        param_count = query.count('?')
+        adapted = query
+        for i in range(param_count, 0, -1):
+            adapted = adapted.replace('?', f'${i}', 1)
+        return adapted
+    return query
 
 
 async def run_crawl_comparison(
@@ -84,7 +197,7 @@ async def run_crawl_comparison(
     
     # Step 2: Generate staging seed list from origin URLs
     print("🔄 Step 2: Generating staging seed list...")
-    staging_seed_urls = await generate_staging_seed_list(origin_crawl_db, origin_domain, staging_domain)
+    staging_seed_urls = await generate_staging_seed_list(origin_crawl_db, origin_domain, staging_domain, origin_url)
     print(f"✅ Generated {len(staging_seed_urls)} staging seed URLs")
     
     # Step 3: Run staging crawl
@@ -122,7 +235,9 @@ async def run_crawl_comparison(
         origin_domain=origin_domain,
         staging_domain=staging_domain,
         commercial_csv=commercial_csv,
-        compare_links=compare_links
+        compare_links=compare_links,
+        origin_url=origin_url,
+        staging_url=staging_url
     )
     
     print(f"✅ Comparison analysis completed!")
@@ -195,22 +310,28 @@ async def init_comparison_db(db_path: str):
         await db.commit()
 
 
-async def generate_staging_seed_list(origin_crawl_db: str, origin_domain: str, staging_domain: str) -> List[str]:
-    """Generate staging seed URLs by converting origin URLs to staging domain."""
-    staging_urls = []
+async def generate_staging_seed_list(origin_crawl_db: str, origin_domain: str, staging_domain: str, origin_url: str = None) -> List[str]:
+    """Generate staging seed URLs by converting origin URLs to staging domain.
     
-    async with aiosqlite.connect(origin_crawl_db) as db:
-        # Get all crawled URLs from origin
-        cursor = await db.execute('''
-            SELECT u.url 
-            FROM urls u
-            JOIN frontier f ON u.id = f.url_id
-            WHERE f.status = 'done' AND u.classification = 'internal'
-        ''')
+    Supports both SQLite and PostgreSQL crawl databases.
+    """
+    staging_urls = []
+    backend = detect_database_backend(origin_crawl_db)
+    query = adapt_query_for_backend('''
+        SELECT u.url 
+        FROM urls u
+        JOIN frontier f ON u.id = f.url_id
+        WHERE f.status = ? AND u.classification = ?
+    ''', backend)
+    
+    # Get connection using abstraction layer
+    conn_context = get_crawl_db_connection(origin_crawl_db, origin_url)
+    async with conn_context as conn:
+        # Both backends use the same parameter passing style
+        rows = await conn.fetchall(query, 'done', 'internal')
         
-        origin_urls = await cursor.fetchall()
-        
-        for (url,) in origin_urls:
+        for row in rows:
+            url = row[0] if isinstance(row, tuple) else row['url']
             # Convert origin URL to staging URL
             staging_url = url.replace(f"https://{origin_domain}", f"https://{staging_domain}")
             staging_url = staging_url.replace(f"http://{origin_domain}", f"http://{staging_domain}")
@@ -226,7 +347,9 @@ async def create_comparison_analysis(
     origin_domain: str,
     staging_domain: str,
     commercial_csv: str = "",
-    compare_links: bool = False
+    compare_links: bool = False,
+    origin_url: str = None,
+    staging_url: str = None
 ):
     """Create comprehensive comparison analysis and views."""
     
@@ -238,7 +361,7 @@ async def create_comparison_analysis(
     
     # Create comparison URLs mapping
     await create_comparison_urls_mapping(
-        comparison_db_path, session_id, origin_crawl_db, staging_crawl_db
+        comparison_db_path, session_id, origin_crawl_db, staging_crawl_db, origin_url, staging_url
     )
     
     # Create comparison views
@@ -271,9 +394,13 @@ async def create_comparison_session(
 
 
 async def create_comparison_urls_mapping(
-    db_path: str, session_id: int, origin_crawl_db: str, staging_crawl_db: str
+    db_path: str, session_id: int, origin_crawl_db: str, staging_crawl_db: str, 
+    origin_url: str = None, staging_url: str = None
 ):
-    """Create mapping of URLs between origin and staging crawls with content analysis."""
+    """Create mapping of URLs between origin and staging crawls with content analysis.
+    
+    Supports both SQLite and PostgreSQL crawl databases.
+    """
     async with aiosqlite.connect(db_path) as db:
         # Get all URLs from both crawls with content data
         origin_urls = {}
@@ -281,22 +408,36 @@ async def create_comparison_urls_mapping(
         origin_redirects = {}
         staging_redirects = {}
         
+        # Detect backends
+        origin_backend = detect_database_backend(origin_crawl_db)
+        staging_backend = detect_database_backend(staging_crawl_db)
+        
         # Get origin URLs with content
-        async with aiosqlite.connect(origin_crawl_db) as origin_db:
-            cursor = await origin_db.execute('''
+        origin_conn_context = get_crawl_db_connection(origin_crawl_db, origin_url)
+        async with origin_conn_context as origin_conn:
+            origin_query = adapt_query_for_backend('''
                 SELECT u.id, u.url, u.classification, c.title, c.h1_tags, c.word_count
                 FROM urls u
                 JOIN frontier f ON u.id = f.url_id
                 LEFT JOIN content c ON u.id = c.url_id
-                WHERE f.status = 'done'
-            ''')
-            for url_id, url, classification, title, h1_tags, word_count in await cursor.fetchall():
+                WHERE f.status = ?
+            ''', origin_backend)
+            
+            rows = await origin_conn.fetchall(origin_query, 'done')
+            for row in rows:
+                url_id = row[0] if isinstance(row, tuple) else row['id']
+                url = row[1] if isinstance(row, tuple) else row['url']
+                classification = row[2] if isinstance(row, tuple) else row['classification']
+                title = row[3] if isinstance(row, tuple) else row['title']
+                h1_tags = row[4] if isinstance(row, tuple) else row['h1_tags']
+                word_count = row[5] if isinstance(row, tuple) else row['word_count']
+                
                 # Extract first H1 from JSON array
                 h1 = None
                 if h1_tags:
                     try:
                         import json
-                        h1_list = json.loads(h1_tags)
+                        h1_list = json.loads(h1_tags) if isinstance(h1_tags, str) else h1_tags
                         h1 = h1_list[0] if h1_list else None
                     except:
                         h1 = None
@@ -311,31 +452,52 @@ async def create_comparison_urls_mapping(
                 }
             
             # Get origin redirects
-            cursor = await origin_db.execute('''
-                SELECT u1.url, u2.url
+            redirect_query = adapt_query_for_backend('''
+                SELECT u1.url as source_url, u2.url as target_url
                 FROM urls u1
                 JOIN redirects r ON u1.id = r.source_url_id
                 JOIN urls u2 ON r.target_url_id = u2.id
-            ''')
-            for source_url, dest_url in await cursor.fetchall():
-                origin_redirects[source_url] = dest_url
+            ''', origin_backend)
+            
+            redirect_rows = await origin_conn.fetchall(redirect_query)
+            for row in redirect_rows:
+                # Handle both tuple and dict-like results
+                if isinstance(row, tuple):
+                    source_url = row[0]
+                    dest_url = row[1] if len(row) > 1 else row[0]
+                else:
+                    # PostgreSQL returns Record objects that are dict-like
+                    source_url = row.get('source_url') or (row[0] if hasattr(row, '__getitem__') else None)
+                    dest_url = row.get('target_url') or (row[1] if len(row) > 1 else source_url)
+                if source_url:
+                    origin_redirects[source_url] = dest_url
         
         # Get staging URLs with content
-        async with aiosqlite.connect(staging_crawl_db) as staging_db:
-            cursor = await staging_db.execute('''
+        staging_conn_context = get_crawl_db_connection(staging_crawl_db, staging_url)
+        async with staging_conn_context as staging_conn:
+            staging_query = adapt_query_for_backend('''
                 SELECT u.id, u.url, u.classification, c.title, c.h1_tags, c.word_count
                 FROM urls u
                 JOIN frontier f ON u.id = f.url_id
                 LEFT JOIN content c ON u.id = c.url_id
-                WHERE f.status = 'done'
-            ''')
-            for url_id, url, classification, title, h1_tags, word_count in await cursor.fetchall():
+                WHERE f.status = ?
+            ''', staging_backend)
+            
+            rows = await staging_conn.fetchall(staging_query, 'done')
+            for row in rows:
+                url_id = row[0] if isinstance(row, tuple) else row['id']
+                url = row[1] if isinstance(row, tuple) else row['url']
+                classification = row[2] if isinstance(row, tuple) else row['classification']
+                title = row[3] if isinstance(row, tuple) else row['title']
+                h1_tags = row[4] if isinstance(row, tuple) else row['h1_tags']
+                word_count = row[5] if isinstance(row, tuple) else row['word_count']
+                
                 # Extract first H1 from JSON array
                 h1 = None
                 if h1_tags:
                     try:
                         import json
-                        h1_list = json.loads(h1_tags)
+                        h1_list = json.loads(h1_tags) if isinstance(h1_tags, str) else h1_tags
                         h1 = h1_list[0] if h1_list else None
                     except:
                         h1 = None
@@ -350,14 +512,25 @@ async def create_comparison_urls_mapping(
                 }
             
             # Get staging redirects
-            cursor = await staging_db.execute('''
-                SELECT u1.url, u2.url
+            redirect_query = adapt_query_for_backend('''
+                SELECT u1.url as source_url, u2.url as target_url
                 FROM urls u1
                 JOIN redirects r ON u1.id = r.source_url_id
                 JOIN urls u2 ON r.target_url_id = u2.id
-            ''')
-            for source_url, dest_url in await cursor.fetchall():
-                staging_redirects[source_url] = dest_url
+            ''', staging_backend)
+            
+            redirect_rows = await staging_conn.fetchall(redirect_query)
+            for row in redirect_rows:
+                # Handle both tuple and dict-like results
+                if isinstance(row, tuple):
+                    source_url = row[0]
+                    dest_url = row[1] if len(row) > 1 else row[0]
+                else:
+                    # PostgreSQL returns Record objects that are dict-like
+                    source_url = row.get('source_url') or (row[0] if hasattr(row, '__getitem__') else None)
+                    dest_url = row.get('target_url') or (row[1] if len(row) > 1 else source_url)
+                if source_url:
+                    staging_redirects[source_url] = dest_url
         
         # Create comparison URLs mapping with redirect handling
         all_paths = set()

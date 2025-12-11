@@ -515,7 +515,7 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
                     else:
                         # No queued URLs - check for stuck pending URLs first
                         from .db_operations import frontier_reset_all_pending_to_queued
-                        pending_reset = await frontier_reset_all_pending_to_queued(db_config)
+                        pending_reset = await frontier_reset_all_pending_to_queued(db_config, max_reset_attempts=5)
                         if pending_reset > 0:
                             print(f"Reset {pending_reset} URLs stuck in pending status - continuing crawl...")
                             next_batch_cache = None
@@ -810,153 +810,154 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
                             print(f"  -> {classification.title()} URL recorded: {child_norm}")
             else:
                 urls_to_upsert.append((original_norm, k, base_domain, parent_norm or normalize_url_for_storage(start)))
+        
+        # Mark frontier as done IMMEDIATELY and synchronously to prevent race conditions
+        # This must complete before the next batch is fetched
+        # Do this AFTER processing all results in the batch, not inside the loop
+        if to_mark_done:
+            await frontier_mark_done(to_mark_done, base_domain, config=db_config)
 
-            # Execute batch operations with parallelization
+        # Execute batch operations with parallelization
+        
+        # Phase 1: Independent operations that can run in parallel
+        phase1_tasks = []
+        enqueue_task_index = -1
+        
+        # Write pages (independent of other operations)
+        if pages_to_write:
+            print(f"  -> Writing {len(pages_to_write)} pages to database...")
+            # Use the new database abstraction
+            phase1_tasks.append(batch_write_pages(pages_to_write, pages_db_path, crawl_db_path, db_config))
+        
+        # Enqueue children (independent of other operations)
+        if children_to_enqueue:
+            print(f"  -> Checking {len(children_to_enqueue)} discovered URLs...")
+            enqueue_task_index = len(phase1_tasks)
+            phase1_tasks.append(batch_enqueue_frontier(children_to_enqueue, db_config))
+        
+        # Run Phase 1 operations in parallel
+        actually_enqueued = 0  # Track for batch complete message
+        if phase1_tasks:
+            results_phase1 = await asyncio.gather(*phase1_tasks, return_exceptions=True)
             
-            # Phase 1: Independent operations that can run in parallel
-            phase1_tasks = []
-            enqueue_task_index = -1
+            # Check for exceptions in results
+            for i, result in enumerate(results_phase1):
+                if isinstance(result, Exception):
+                    task_name = "batch_write_pages" if i == 0 else ("batch_enqueue_frontier" if i == enqueue_task_index else f"task_{i}")
+                    print(f"  -> ERROR: Exception in {task_name}: {result}")
+                    import traceback
+                    traceback.print_exception(type(result), result, result.__traceback__)
             
-            # Mark frontier as done IMMEDIATELY and synchronously to prevent race conditions
-            # This must complete before the next batch is fetched
-            if to_mark_done:
-                await frontier_mark_done(to_mark_done, base_domain, config=db_config)
+            # Log actual count of URLs enqueued (after filtering)
+            if enqueue_task_index >= 0 and enqueue_task_index < len(results_phase1):
+                enqueue_result = results_phase1[enqueue_task_index]
+                if not isinstance(enqueue_result, Exception) and enqueue_result is not None:
+                    actually_enqueued = enqueue_result
+                    skipped = len(children_to_enqueue) - actually_enqueued
+                    if actually_enqueued > 0:
+                        if skipped > 0:
+                            print(f"  -> Enqueued {actually_enqueued} new URLs to frontier (skipped {skipped} already in frontier)")
+                        else:
+                            print(f"  -> Enqueued {actually_enqueued} new URLs to frontier")
+                    elif skipped > 0:
+                        print(f"  -> All {skipped} URLs already in frontier (skipped)")
+        else:
+            # No phase1 tasks, so no URLs were enqueued
+            actually_enqueued = 0
+        
+        # Now that current batch is marked as done, prefetch next batch
+        if limits.max_pages == 0 or processed + batch_size < limits.max_pages:
+            next_batch_task = asyncio.create_task(
+                frontier_next_batch(batch_size, config=db_config)
+            )
+        
+        # Phase 2: URL operations (must complete before content/links/redirects)
+        if urls_to_upsert:
+            if shutdown_requested or force_quit:
+                break
+            print(f"  -> Upserting {len(urls_to_upsert)} URLs to database...")
+            await batch_upsert_urls(urls_to_upsert, db_config)
+        
+        # Phase 3: Content-dependent operations that can run in parallel
+        phase3_tasks = []
+        
+        # Write content (depends on URLs being upserted)
+        if content_to_write:
+            print(f"  -> Writing {len(content_to_write)} content extractions to database...")
+            phase3_tasks.append(batch_write_content_with_url_resolution(content_to_write, crawl_db_path, db_config))
+        
+        # Write internal links (depends on URLs being upserted)
+        if links_to_write:
+            print(f"  -> Writing {len(links_to_write)} internal links to database...")
+            phase3_tasks.append(batch_write_internal_links(links_to_write, crawl_db_path, db_config))
+        
+        # Write redirect data (depends on URLs being upserted)
+        if redirect_data_to_write:
+            print(f"  -> Writing {len(redirect_data_to_write)} redirect chains to database...")
+            phase3_tasks.append(batch_write_redirects(redirect_data_to_write, crawl_db_path, db_config))
+        
+        # Run Phase 3 operations in parallel
+        if phase3_tasks:
+            # Check for shutdown before starting database operations
+            if shutdown_requested or force_quit:
+                print("Shutdown requested. Skipping database operations...")
+                break
             
-            # Write pages (independent of other operations)
-            if pages_to_write:
-                print(f"  -> Writing {len(pages_to_write)} pages to database...")
-                # Use the new database abstraction
-                phase1_tasks.append(batch_write_pages(pages_to_write, pages_db_path, crawl_db_path, db_config))
-            
-            # Enqueue children (independent of other operations)
-            if children_to_enqueue:
-                print(f"  -> Checking {len(children_to_enqueue)} discovered URLs...")
-                enqueue_task_index = len(phase1_tasks)
-                phase1_tasks.append(batch_enqueue_frontier(children_to_enqueue, db_config))
-            
-            # Run Phase 1 operations in parallel
-            actually_enqueued = 0  # Track for batch complete message
-            if phase1_tasks:
-                results_phase1 = await asyncio.gather(*phase1_tasks, return_exceptions=True)
+            # Run operations with timeout and cancellation support
+            try:
+                # Create tasks
+                task_list = [asyncio.create_task(task) for task in phase3_tasks]
                 
-                # Check for exceptions in results
-                for i, result in enumerate(results_phase1):
-                    if isinstance(result, Exception):
-                        task_name = "batch_write_pages" if i == 0 else ("batch_enqueue_frontier" if i == enqueue_task_index else f"task_{i}")
-                        print(f"  -> ERROR: Exception in {task_name}: {result}")
-                        import traceback
-                        traceback.print_exception(type(result), result, result.__traceback__)
-                
-                # Log actual count of URLs enqueued (after filtering)
-                if enqueue_task_index >= 0 and enqueue_task_index < len(results_phase1):
-                    enqueue_result = results_phase1[enqueue_task_index]
-                    if not isinstance(enqueue_result, Exception) and enqueue_result is not None:
-                        actually_enqueued = enqueue_result
-                        skipped = len(children_to_enqueue) - actually_enqueued
-                        if actually_enqueued > 0:
-                            if skipped > 0:
-                                print(f"  -> Enqueued {actually_enqueued} new URLs to frontier (skipped {skipped} already in frontier)")
-                            else:
-                                print(f"  -> Enqueued {actually_enqueued} new URLs to frontier")
-                        elif skipped > 0:
-                            print(f"  -> All {skipped} URLs already in frontier (skipped)")
-            else:
-                # No phase1 tasks, so no URLs were enqueued
-                actually_enqueued = 0
-            
-            # Now that current batch is marked as done, prefetch next batch
-            if limits.max_pages == 0 or processed + batch_size < limits.max_pages:
-                next_batch_task = asyncio.create_task(
-                    frontier_next_batch(batch_size, config=db_config)
+                # Wait for completion with a timeout
+                done, pending = await asyncio.wait(
+                    task_list,
+                    timeout=60.0,  # 60 second timeout
+                    return_when=asyncio.ALL_COMPLETED
                 )
-            
-            # Phase 2: URL operations (must complete before content/links/redirects)
-            if urls_to_upsert:
-                if shutdown_requested or force_quit:
-                    break
-                print(f"  -> Upserting {len(urls_to_upsert)} URLs to database...")
-                await batch_upsert_urls(urls_to_upsert, db_config)
-            
-            # Phase 3: Content-dependent operations that can run in parallel
-            phase3_tasks = []
-            
-            # Write content (depends on URLs being upserted)
-            if content_to_write:
-                print(f"  -> Writing {len(content_to_write)} content extractions to database...")
-                phase3_tasks.append(batch_write_content_with_url_resolution(content_to_write, crawl_db_path, db_config))
-            
-            # Write internal links (depends on URLs being upserted)
-            if links_to_write:
-                print(f"  -> Writing {len(links_to_write)} internal links to database...")
-                phase3_tasks.append(batch_write_internal_links(links_to_write, crawl_db_path, db_config))
-            
-            # Write redirect data (depends on URLs being upserted)
-            if redirect_data_to_write:
-                print(f"  -> Writing {len(redirect_data_to_write)} redirect chains to database...")
-                phase3_tasks.append(batch_write_redirects(redirect_data_to_write, crawl_db_path, db_config))
-            
-            # Run Phase 3 operations in parallel
-            if phase3_tasks:
-                # Check for shutdown before starting database operations
-                if shutdown_requested or force_quit:
-                    print("Shutdown requested. Skipping database operations...")
-                    break
                 
-                # Run operations with timeout and cancellation support
-                try:
-                    # Create tasks
-                    task_list = [asyncio.create_task(task) for task in phase3_tasks]
+                # Check if shutdown was requested during operations
+                if shutdown_requested or force_quit:
+                    # Cancel any pending tasks
+                    for task in pending:
+                        task.cancel()
+                    # Don't wait for cancellation - break immediately
+                    print("Shutdown detected. Cancelling database operations...")
+                    break
                     
-                    # Wait for completion with a timeout
-                    done, pending = await asyncio.wait(
-                        task_list,
-                        timeout=60.0,  # 60 second timeout
-                        return_when=asyncio.ALL_COMPLETED
-                    )
-                    
-                    # Check if shutdown was requested during operations
-                    if shutdown_requested or force_quit:
-                        # Cancel any pending tasks
-                        for task in pending:
-                            task.cancel()
-                        # Don't wait for cancellation - break immediately
-                        print("Shutdown detected. Cancelling database operations...")
-                        break
-                        
-                except asyncio.CancelledError:
-                    if shutdown_requested or force_quit:
-                        print("Database operations cancelled.")
-                        break
-                except Exception as e:
-                    if not (shutdown_requested or force_quit):
-                        print(f"Error in database operations: {e}")
-            
-            # Phase 4: Hreflang processing (depends on content being written)
-            if content_to_write:
-                from .db_operations import add_hreflang_urls_to_frontier
-                await add_hreflang_urls_to_frontier(crawl_db_path, base_domain, db_config)
-            
-            # Store the prefetched batch for the next iteration
-            if next_batch_task:
-                try:
-                    next_batch = await next_batch_task
-                    if next_batch:
-                        next_batch_cache = next_batch
-                    else:
-                        # No more URLs available, we'll exit on next iteration
-                        next_batch_cache = None
-                except Exception as e:
-                    print(f"Warning: Failed to prefetch next batch: {e}")
+            except asyncio.CancelledError:
+                if shutdown_requested or force_quit:
+                    print("Database operations cancelled.")
+                    break
+            except Exception as e:
+                if not (shutdown_requested or force_quit):
+                    print(f"Error in database operations: {e}")
+        
+        # Phase 4: Hreflang processing (depends on content being written)
+        if content_to_write:
+            from .db_operations import add_hreflang_urls_to_frontier
+            await add_hreflang_urls_to_frontier(crawl_db_path, base_domain, db_config)
+        
+        # Store the prefetched batch for the next iteration
+        if next_batch_task:
+            try:
+                next_batch = await next_batch_task
+                if next_batch:
+                    next_batch_cache = next_batch
+                else:
+                    # No more URLs available, we'll exit on next iteration
                     next_batch_cache = None
-            
-            processed += len(results)
-            
-            print(f"Batch complete: processed {len(results)} URLs, enqueued {actually_enqueued} new URLs")
-            if limits.max_pages > 0:
-                print(f"Total processed so far: {processed}/{limits.max_pages}")
-            else:
-                print(f"Total processed so far: {processed} (no limit)")
-            print()
+            except Exception as e:
+                print(f"Warning: Failed to prefetch next batch: {e}")
+                next_batch_cache = None
+        
+        processed += len(results)
+        
+        print(f"Batch complete: processed {len(results)} URLs, enqueued {actually_enqueued} new URLs")
+        if limits.max_pages > 0:
+            print(f"Total processed so far: {processed}/{limits.max_pages}")
+        else:
+            print(f"Total processed so far: {processed} (no limit)")
+        print()
 
     # Final frontier stats
     q, d = await frontier_stats(config=db_config)

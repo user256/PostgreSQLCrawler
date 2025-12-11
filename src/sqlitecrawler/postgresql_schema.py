@@ -315,6 +315,7 @@ CREATE TABLE IF NOT EXISTS frontier (
     sitemap_priority REAL DEFAULT 0.5,
     inlinks_count INTEGER DEFAULT 0,
     content_type_score REAL DEFAULT 1.0,
+    reset_count INTEGER DEFAULT 0,
     FOREIGN KEY (url_id) REFERENCES urls (id),
     FOREIGN KEY (parent_id) REFERENCES urls (id),
     UNIQUE(url_id)

@@ -113,6 +113,9 @@ PrivateTexting.md
 crawl_improvements.md
 comparison_improvements.md
 
+# Web interface
+interface/
+
 # Temporary/error files
 None
 *.tmp

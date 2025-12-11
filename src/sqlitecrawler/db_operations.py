@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS frontier (
   sitemap_priority REAL DEFAULT 0.5,
   inlinks_count INTEGER DEFAULT 0,
   content_type_score REAL DEFAULT 1.0,
+  reset_count INTEGER DEFAULT 0,
   FOREIGN KEY (url_id) REFERENCES urls (id),
   FOREIGN KEY (parent_id) REFERENCES urls (id),
   UNIQUE(url_id)
@@ -444,6 +445,12 @@ async def init_crawl_db(config: DatabaseConfig, crawl_db_path: str = None):
                     # Constraint might already exist with correct values, that's fine
                     pass
             
+            # Add reset_count column if it doesn't exist
+            try:
+                await conn.execute("ALTER TABLE frontier ADD COLUMN IF NOT EXISTS reset_count INTEGER DEFAULT 0")
+            except Exception as e:
+                print(f"Warning: Could not add reset_count column: {e}")
+            
             # Create database views
             view_statements = get_postgres_views()
             for view_stmt in view_statements:
@@ -477,6 +484,13 @@ async def init_crawl_db(config: DatabaseConfig, crawl_db_path: str = None):
             for stmt in statements:
                 if stmt:
                     await conn.execute(stmt)
+            
+            # Add reset_count column if it doesn't exist (migration)
+            try:
+                await conn.execute("ALTER TABLE frontier ADD COLUMN reset_count INTEGER DEFAULT 0")
+            except Exception:
+                # Column already exists, that's fine
+                pass
             
             # Create database views
             view_statements = get_sqlite_views()
@@ -965,12 +979,13 @@ async def frontier_mark_done(urls: List[str], base_domain: str, config: Database
         current_time = int(time.time())
         # Update from 'pending' to 'done', or insert if missing
         query = """
-        INSERT INTO frontier (url_id, depth, status, enqueued_at, updated_at, priority_score)
-        SELECT url_id, 0, 'done', $1, $1, 0.0
+        INSERT INTO frontier (url_id, depth, status, enqueued_at, updated_at, priority_score, reset_count)
+        SELECT url_id, 0, 'done', $1, $1, 0.0, 0
         FROM UNNEST($2::bigint[]) AS url_id
         ON CONFLICT (url_id) DO UPDATE SET
             status = 'done',
-            updated_at = $1
+            updated_at = $1,
+            reset_count = 0
         WHERE frontier.status IN ('pending', 'queued')
         """
         # Retry logic for deadlock errors
@@ -993,10 +1008,10 @@ async def frontier_mark_done(urls: List[str], base_domain: str, config: Database
                     # Re-raise if not a deadlock or out of retries
                     raise
     else:
-        # SQLite: Update from 'pending' or 'queued' to 'done'
+        # SQLite: Update from 'pending' or 'queued' to 'done', reset counter
         query = """
         UPDATE frontier 
-        SET status = 'done', updated_at = strftime('%s', 'now')
+        SET status = 'done', updated_at = strftime('%s', 'now'), reset_count = 0
         WHERE url_id = ? AND status IN ('pending', 'queued')
         """
         async with create_connection() as conn:
@@ -1005,37 +1020,108 @@ async def frontier_mark_done(urls: List[str], base_domain: str, config: Database
             await conn.commit()
 
 
-async def frontier_reset_all_pending_to_queued(config: DatabaseConfig = None) -> int:
+async def frontier_reset_all_pending_to_queued(config: DatabaseConfig = None, max_reset_attempts: int = 5) -> int:
     """Reset all URLs stuck in 'pending' status back to 'queued'.
     
-    Returns the number of URLs reset.
+    URLs that have exceeded max_reset_attempts will be marked as 'done' with a timeout error
+    instead of being reset again.
+    
+    Args:
+        config: Database configuration
+        max_reset_attempts: Maximum number of times a URL can be reset before being marked as failed
+    
+    Returns:
+        Tuple of (reset_count, failed_count) - number of URLs reset and number marked as failed
     """
     if config is None:
         config = get_database_config()
     
     if config.backend == "postgresql":
         current_time = int(time.time())
-        query = """
-        UPDATE frontier 
-        SET status = 'queued', updated_at = $1
-        WHERE status = 'pending'
-        RETURNING url_id
-        """
         async with create_connection() as conn:
-            result = await conn.fetchall(query, current_time)
-            return len(result)
+            # First, mark URLs that have exceeded max attempts as done (timeout)
+            failed_query = """
+            UPDATE frontier 
+            SET status = 'done', updated_at = $1
+            WHERE status = 'pending' AND reset_count >= $2
+            RETURNING url_id
+            """
+            failed_result = await conn.fetchall(failed_query, current_time, max_reset_attempts)
+            failed_count = len(failed_result)
+            
+            if failed_count > 0:
+                # Log the failed URLs
+                url_rows = await conn.fetchall("SELECT url FROM urls WHERE id = ANY($1::bigint[])", 
+                                               [row[0] for row in failed_result])
+                failed_urls = [row[0] for row in url_rows]
+                if len(failed_urls) <= 5:
+                    for url in failed_urls:
+                        print(f"  -> Marking {url} as failed (timeout: exceeded {max_reset_attempts} reset attempts)")
+                else:
+                    for url in failed_urls[:3]:
+                        print(f"  -> Marking {url} as failed (timeout: exceeded {max_reset_attempts} reset attempts)")
+                    print(f"  -> ... and {len(failed_urls) - 3} more URLs marked as failed")
+            
+            # Now reset URLs that haven't exceeded max attempts
+            reset_query = """
+            UPDATE frontier 
+            SET status = 'queued', updated_at = $1, reset_count = reset_count + 1
+            WHERE status = 'pending' AND reset_count < $2
+            RETURNING url_id
+            """
+            reset_result = await conn.fetchall(reset_query, current_time, max_reset_attempts)
+            reset_count = len(reset_result)
+            
+            if failed_count > 0:
+                print(f"  -> Marked {failed_count} URLs as failed (exceeded {max_reset_attempts} reset attempts)")
+            
+            return reset_count
     else:
-        query = """
-        UPDATE frontier 
-        SET status = 'queued', updated_at = strftime('%s', 'now')
-        WHERE status = 'pending'
-        """
         async with create_connection() as conn:
-            await conn.execute(query)
+            # First, mark URLs that have exceeded max attempts as done (timeout)
+            failed_query = """
+            UPDATE frontier 
+            SET status = 'done', updated_at = strftime('%s', 'now')
+            WHERE status = 'pending' AND reset_count >= ?
+            """
+            await conn.execute(failed_query, max_reset_attempts)
+            failed_count_result = await conn.fetchone("SELECT changes()")
+            failed_count = failed_count_result[0] if failed_count_result and failed_count_result[0] is not None else 0
+            
+            if failed_count > 0:
+                # Log the failed URLs
+                failed_urls_query = """
+                SELECT u.url 
+                FROM frontier f
+                JOIN urls u ON f.url_id = u.id
+                WHERE f.status = 'done' AND f.reset_count >= ?
+                """
+                failed_urls = await conn.fetchall(failed_urls_query, max_reset_attempts)
+                failed_url_list = [row[0] for row in failed_urls]
+                if len(failed_url_list) <= 5:
+                    for url in failed_url_list:
+                        print(f"  -> Marking {url} as failed (timeout: exceeded {max_reset_attempts} reset attempts)")
+                else:
+                    for url in failed_url_list[:3]:
+                        print(f"  -> Marking {url} as failed (timeout: exceeded {max_reset_attempts} reset attempts)")
+                    print(f"  -> ... and {len(failed_url_list) - 3} more URLs marked as failed")
+            
+            # Now reset URLs that haven't exceeded max attempts
+            reset_query = """
+            UPDATE frontier 
+            SET status = 'queued', updated_at = strftime('%s', 'now'), reset_count = reset_count + 1
+            WHERE status = 'pending' AND reset_count < ?
+            """
+            await conn.execute(reset_query, max_reset_attempts)
             await conn.commit()
-            # Get count of updated rows using changes()
-            count_result = await conn.fetchone("SELECT changes()")
-            return count_result[0] if count_result and count_result[0] is not None else 0
+            
+            reset_count_result = await conn.fetchone("SELECT changes()")
+            reset_count = reset_count_result[0] if reset_count_result and reset_count_result[0] is not None else 0
+            
+            if failed_count > 0:
+                print(f"  -> Marked {failed_count} URLs as failed (exceeded {max_reset_attempts} reset attempts)")
+            
+            return reset_count
 
 
 async def frontier_stats(config: DatabaseConfig = None) -> Tuple[int, int]:
@@ -2303,6 +2389,8 @@ async def batch_write_internal_links(links_data: List[Dict], crawl_db_path: str 
             
             # Prepare batch data and track link counts per source URL
             batch_data = []
+            # Use a set to track unique links and prevent duplicates within this batch
+            seen_links = set()
             current_time = int(time.time())
             # Track link counts per source_url_id: {source_url_id: {'internal': count, 'external': count, 'internal_unique': set, 'external_unique': set}}
             link_counts = {}
@@ -2338,20 +2426,6 @@ async def batch_write_internal_links(links_data: List[Dict], crawl_db_path: str 
                     if not href_url_id:
                         continue  # Skip if essential IDs not found
                     
-                    # Get target URL for classification
-                    target_url = link_item.get('url')
-                    if target_url:
-                        # Classify the link using normalized URL
-                        classification = classify_url(target_url, base_domain)
-                        
-                        # Count internal vs external for statistics
-                        if classification == 'internal':
-                            link_counts[source_url_id]['internal'] += 1
-                            link_counts[source_url_id]['internal_unique'].add(target_url)
-                        else:
-                            link_counts[source_url_id]['external'] += 1
-                            link_counts[source_url_id]['external_unique'].add(target_url)
-                    
                     # Get or create anchor text ID if provided (still individual, but less frequent)
                     anchor_text_id = None
                     if link_item.get('anchor_text'):
@@ -2366,6 +2440,36 @@ async def batch_write_internal_links(links_data: List[Dict], crawl_db_path: str 
                     fragment_id = None
                     if link_item.get('fragment'):
                         fragment_id = await get_or_create_fragment_id(link_item['fragment'], config)
+                    
+                    # Create a unique key for this link to prevent duplicates within this batch
+                    link_key = (
+                        source_url_id,
+                        target_url_id,
+                        anchor_text_id,
+                        xpath_id,
+                        href_url_id,
+                        fragment_id,
+                        link_item.get('url_parameters')
+                    )
+                    
+                    # Skip if we've already seen this exact link in this batch
+                    if link_key in seen_links:
+                        continue
+                    seen_links.add(link_key)
+                    
+                    # Get target URL for classification
+                    target_url = link_item.get('url')
+                    if target_url:
+                        # Classify the link using normalized URL
+                        classification = classify_url(target_url, base_domain)
+                        
+                        # Count internal vs external for statistics
+                        if classification == 'internal':
+                            link_counts[source_url_id]['internal'] += 1
+                            link_counts[source_url_id]['internal_unique'].add(target_url)
+                        else:
+                            link_counts[source_url_id]['external'] += 1
+                            link_counts[source_url_id]['external_unique'].add(target_url)
                     
                     batch_data.append((
                         source_url_id,
@@ -2414,9 +2518,25 @@ async def batch_write_internal_links(links_data: List[Dict], crawl_db_path: str 
 
 
 async def get_or_create_anchor_text_id(anchor_text: str, config: DatabaseConfig = None) -> int:
-    """Get or create anchor text ID."""
+    """Get or create anchor text ID.
+    
+    For PostgreSQL, anchor texts are truncated to 2000 bytes to avoid exceeding
+    the btree index size limit (2704 bytes).
+    """
     if config is None:
         config = get_database_config()
+    
+    # Truncate anchor text if it's too long (PostgreSQL btree index limit is 2704 bytes)
+    # Use 2000 bytes to leave headroom for encoding overhead
+    MAX_ANCHOR_TEXT_BYTES = 2000
+    if len(anchor_text.encode('utf-8')) > MAX_ANCHOR_TEXT_BYTES:
+        # Truncate to fit within byte limit, preserving UTF-8 encoding
+        encoded = anchor_text.encode('utf-8')
+        truncated = encoded[:MAX_ANCHOR_TEXT_BYTES]
+        # Decode back, handling potential incomplete UTF-8 sequences at the end
+        anchor_text = truncated.decode('utf-8', errors='ignore')
+        # Remove any trailing incomplete characters
+        anchor_text = anchor_text.rstrip('\ufffd')
     
     async with create_connection() as conn:
         # Try to get existing ID
