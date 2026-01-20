@@ -87,3 +87,7 @@ if __name__ == "__main__":
         # PostgreSQL mode (uses environment variables)
         asyncio.run(recreate_views_postgresql())
 
+
+
+
+

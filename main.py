@@ -26,6 +26,12 @@ Examples:
                    help="Maximum pages to process in this run (default: no limit)")
     p.add_argument("--max-depth", type=int, default=None, 
                    help="Maximum crawl depth (default: 3)")
+    p.add_argument("--path-restriction", type=str, default="",
+                   help="Only crawl URLs containing this path (e.g., '/en-za/'). URLs outside this path are recorded but not crawled.")
+    p.add_argument("--path-exclude", type=str, default="",
+                   help="Comma-separated path prefixes to skip (e.g., '/news/,/blog'). These URLs will be recorded but not crawled.")
+    p.add_argument("--allow-domains", type=str, default="",
+                   help="Comma-separated domain or subdomain suffixes to allow (e.g., 'example.com,sub.example.com'). Only URLs whose host ends with one of these will be crawled.")
     p.add_argument("--offsite", action="store_true", 
                    help="Allow offsite traversal (default: same host only)")
     p.add_argument("--reset-frontier", action="store_true", 
@@ -162,10 +168,23 @@ Examples:
         args.skip_robots_sitemaps = True
 
     # Create crawl limits
+    path_exclude_prefixes = [p.strip() for p in (args.path_exclude or "").split(",") if p.strip()]
+    allowed_domains = [d.strip().lower() for d in (args.allow_domains or "").split(",") if d.strip()]
+    # Normalize to ensure leading slash for consistency
+    normalized_excludes = []
+    for prefix in path_exclude_prefixes:
+        if prefix.startswith("/"):
+            normalized_excludes.append(prefix)
+        else:
+            normalized_excludes.append("/" + prefix)
+    
     limits = CrawlLimits(
         max_pages=args.max_pages if args.max_pages is not None else CrawlLimits().max_pages,
         max_depth=args.max_depth if args.max_depth is not None else CrawlLimits().max_depth,
         same_host_only=not args.offsite,
+        path_restriction=args.path_restriction,
+        path_exclude_prefixes=normalized_excludes,
+        allowed_domains=allowed_domains,
     )
     
     # Create HTTP configuration
@@ -314,6 +333,8 @@ Examples:
         print(f"  Max Pages: {limits.max_pages}")
         print(f"  Max Depth: {limits.max_depth}")
         print(f"  Same Host Only: {limits.same_host_only}")
+        if limits.path_restriction:
+            print(f"  Path Restriction: {limits.path_restriction}")
         print(f"  JavaScript Rendering: {args.js}")
         print(f"  Timeout: {http_config.timeout}s")
         print(f"  Concurrency: {http_config.max_concurrency}")
@@ -352,6 +373,11 @@ Examples:
     if not start_url and csv_urls:
         start_url = csv_urls[0]
         print(f"Using first CSV URL as start URL: {start_url}")
+    
+    # Notify user if path restriction is active
+    if limits.path_restriction:
+        print(f"📁 Path restriction active: only URLs containing '{limits.path_restriction}' will be crawled")
+        print(f"   URLs outside this path will be recorded but not followed.")
     
     # Handle crawl comparison if compare-domain is specified
     if args.compare_domain:

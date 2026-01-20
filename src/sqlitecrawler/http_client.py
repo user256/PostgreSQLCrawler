@@ -380,13 +380,18 @@ def _curl_fetch_sync(url: str, cfg: HttpConfig, conditional_headers: Dict[str, s
     
     headers = _build_headers(cfg, conditional_headers)
     
-    with curl_requests.Session() as session:
-        session.headers.update(headers)
-        kwargs = _curl_request_kwargs(cfg, True, auth_tuple)
-        response = session.get(url, **kwargs)
-        hdrs = dict(response.headers)
-        text = _decode_response_content(response.content, hdrs)
-        return response.status_code, str(response.url), hdrs, text, url
+    try:
+        with curl_requests.Session() as session:
+            session.headers.update(headers)
+            kwargs = _curl_request_kwargs(cfg, True, auth_tuple)
+            response = session.get(url, **kwargs)
+            hdrs = dict(response.headers)
+            text = _decode_response_content(response.content, hdrs)
+            return response.status_code, str(response.url), hdrs, text, url
+    except Exception as e:
+        # Catch timeout errors, connection errors, and other curl exceptions
+        # Return a failed result so the crawler can continue
+        return 0, url, {}, "", url
 
 
 def _curl_fetch_with_redirects_sync(
@@ -403,36 +408,41 @@ def _curl_fetch_with_redirects_sync(
     final_response = None
     current_url = url
     
-    with curl_requests.Session() as session:
-        session.headers.update(headers)
-        kwargs = _curl_request_kwargs(cfg, False, auth_tuple)
+    try:
+        with curl_requests.Session() as session:
+            session.headers.update(headers)
+            kwargs = _curl_request_kwargs(cfg, False, auth_tuple)
+            
+            for _ in range(10):
+                response = session.get(current_url, **kwargs)
+                redirect_chain.append({
+                    "url": current_url,
+                    "status": response.status_code,
+                    "headers": dict(response.headers)
+                })
+                
+                if response.status_code in CURL_REDIRECT_STATUSES:
+                    location = response.headers.get("location")
+                    if location:
+                        if location.startswith("/"):
+                            current_url = urljoin(current_url, location)
+                        else:
+                            current_url = urljoin(current_url, location)
+                        continue
+                
+                final_response = response
+                break
         
-        for _ in range(10):
-            response = session.get(current_url, **kwargs)
-            redirect_chain.append({
-                "url": current_url,
-                "status": response.status_code,
-                "headers": dict(response.headers)
-            })
-            
-            if response.status_code in CURL_REDIRECT_STATUSES:
-                location = response.headers.get("location")
-                if location:
-                    if location.startswith("/"):
-                        current_url = urljoin(current_url, location)
-                    else:
-                        current_url = urljoin(current_url, location)
-                    continue
-            
-            final_response = response
-            break
-    
-    if final_response is None:
+        if final_response is None:
+            return 0, url, {}, "", url, json.dumps(redirect_chain)
+        
+        hdrs = dict(final_response.headers)
+        text = _decode_response_content(final_response.content, hdrs)
+        return final_response.status_code, str(final_response.url), hdrs, text, url, json.dumps(redirect_chain)
+    except Exception as e:
+        # Catch timeout errors, connection errors, and other curl exceptions
+        # Return a failed result so the crawler can continue
         return 0, url, {}, "", url, json.dumps(redirect_chain)
-    
-    hdrs = dict(final_response.headers)
-    text = _decode_response_content(final_response.content, hdrs)
-    return final_response.status_code, str(final_response.url), hdrs, text, url, json.dumps(redirect_chain)
 
 
 async def fetch_curl(url: str, cfg: HttpConfig, conditional_headers: Dict[str, str] = None) -> Tuple[int, str, Dict[str, str], str, str]:

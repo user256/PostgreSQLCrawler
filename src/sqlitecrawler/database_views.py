@@ -101,7 +101,10 @@ SELECT
     COALESCE(i.http_header_directives, '') as http_header_directives,
     GROUP_CONCAT(DISTINCT canonical_urls_table.url) as canonical_urls,
     GROUP_CONCAT(DISTINCT cu.source) as canonical_sources,
-    redirect_dest.url as redirect_destination_url,
+    CASE 
+        WHEN pm.initial_status_code IN (301, 302, 303, 307, 308) THEN redirect_dest.url
+        ELSE NULL
+    END as redirect_destination_url,
     -- Find the hreflang language that points to this page itself (excluding x-default)
     (SELECT hl_self.language_code 
      FROM hreflang_sitemap hs_self 
@@ -184,6 +187,10 @@ SELECT DISTINCT
     END as target_is_self_canonical,
     CASE 
         WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        WHEN EXISTS (
+            SELECT 1 FROM page_metadata pm_redirect 
+            WHERE pm_redirect.final_url_id = target.id
+        ) THEN 1
         ELSE 0
     END as target_resolves
 FROM internal_links il
@@ -194,6 +201,7 @@ LEFT JOIN xpaths x ON il.xpath_id = x.id
 LEFT JOIN fragments f ON il.fragment_id = f.id
 LEFT JOIN page_metadata pm ON target.id = pm.url_id
 WHERE source.classification = 'internal' AND (target.classification = 'internal' OR target.classification IS NULL)
+  AND (pm.url_id IS NOT NULL OR EXISTS (SELECT 1 FROM page_metadata pm_check WHERE pm_check.final_url_id = target.id))  -- Only include crawled target URLs
 GROUP BY source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters, target_status_code, target_resolves;
 
 -- Network links view
@@ -244,6 +252,10 @@ SELECT DISTINCT
     END as target_is_self_canonical,
     CASE 
         WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        WHEN EXISTS (
+            SELECT 1 FROM page_metadata pm_redirect 
+            WHERE pm_redirect.final_url_id = target.id
+        ) THEN 1
         ELSE 0
     END as target_resolves
 FROM internal_links il
@@ -279,9 +291,10 @@ SELECT
         ELSE 'unknown issue'
     END as invalid_reason
 FROM view_links_internal
-WHERE target_resolves = 0 
+WHERE target_status_code IS NOT NULL  -- Only include crawled URLs
+  AND (target_resolves = 0 
    OR target_is_self_canonical = 0 
-   OR (target_status_code IS NOT NULL AND target_status_code != 200)
+   OR target_status_code != 200)
 UNION ALL
 SELECT 
     source_url,
@@ -304,9 +317,10 @@ SELECT
         ELSE 'unknown issue'
     END as invalid_reason
 FROM view_links_external
-WHERE target_resolves = 0 
+WHERE target_status_code IS NOT NULL  -- Only include crawled URLs
+  AND (target_resolves = 0 
    OR target_is_self_canonical = 0 
-   OR (target_status_code IS NOT NULL AND target_status_code != 200);
+   OR target_status_code != 200);
 
 -- Subdomain links view
 CREATE VIEW IF NOT EXISTS view_links_subdomain AS
@@ -524,7 +538,10 @@ SELECT
     COALESCE(i.http_header_directives, '') as http_header_directives,
     (SELECT array_agg(DISTINCT canonical_urls_table.url) FROM canonical_urls cu_agg JOIN urls canonical_urls_table ON cu_agg.canonical_url_id = canonical_urls_table.id WHERE cu_agg.url_id = u.id) as canonical_urls,
     (SELECT array_agg(DISTINCT cu_agg.source) FROM canonical_urls cu_agg WHERE cu_agg.url_id = u.id) as canonical_sources,
-    redirect_dest.url as redirect_destination_url,
+    CASE 
+        WHEN pm.initial_status_code IN (301, 302, 303, 307, 308) THEN redirect_dest.url
+        ELSE NULL
+    END as redirect_destination_url,
     -- Find the hreflang language that points to this page itself (excluding x-default)
     (SELECT hl_self.language_code 
      FROM hreflang_html_head hs_self 
@@ -607,6 +624,10 @@ SELECT DISTINCT ON (source.url, target.url, at.text, x.xpath, f.fragment, il.url
     END as target_is_self_canonical,
     CASE 
         WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        WHEN EXISTS (
+            SELECT 1 FROM page_metadata pm_redirect 
+            WHERE pm_redirect.final_url_id = target.id
+        ) THEN 1
         ELSE 0
     END as target_resolves
 FROM internal_links il
@@ -617,6 +638,7 @@ LEFT JOIN xpaths x ON il.xpath_id = x.id
 LEFT JOIN fragments f ON il.fragment_id = f.id
 LEFT JOIN page_metadata pm ON target.id = pm.url_id
 WHERE source.classification = 'internal' AND (target.classification = 'internal' OR target.classification IS NULL)
+  AND (pm.url_id IS NOT NULL OR EXISTS (SELECT 1 FROM page_metadata pm_check WHERE pm_check.final_url_id = target.id))  -- Only include crawled target URLs
 ORDER BY source.url, target.url, at.text, x.xpath, f.fragment, il.url_parameters, il.discovered_at;
 
 -- External links view (PostgreSQL version)
@@ -646,6 +668,10 @@ SELECT DISTINCT ON (source.url, target.url, at.text, x.xpath, f.fragment, il.url
     END as target_is_self_canonical,
     CASE 
         WHEN pm.url_id IS NOT NULL AND (pm.final_url_id IS NULL OR pm.final_url_id = target.id) THEN 1
+        WHEN EXISTS (
+            SELECT 1 FROM page_metadata pm_redirect 
+            WHERE pm_redirect.final_url_id = target.id
+        ) THEN 1
         ELSE 0
     END as target_resolves
 FROM internal_links il
@@ -681,9 +707,10 @@ SELECT
         ELSE 'unknown issue'
     END as invalid_reason
 FROM view_links_internal
-WHERE target_resolves = 0 
+WHERE target_status_code IS NOT NULL  -- Only include crawled URLs
+  AND (target_resolves = 0 
    OR target_is_self_canonical = 0 
-   OR (target_status_code IS NOT NULL AND target_status_code != 200)
+   OR target_status_code != 200)
 UNION ALL
 SELECT 
     source_url,
@@ -706,9 +733,10 @@ SELECT
         ELSE 'unknown issue'
     END as invalid_reason
 FROM view_links_external
-WHERE target_resolves = 0 
+WHERE target_status_code IS NOT NULL  -- Only include crawled URLs
+  AND (target_resolves = 0 
    OR target_is_self_canonical = 0 
-   OR (target_status_code IS NOT NULL AND target_status_code != 200);
+   OR target_status_code != 200);
 
 -- Schema analysis view (PostgreSQL version)
 CREATE OR REPLACE VIEW view_schema_analysis AS

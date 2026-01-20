@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 DATA_DIR = os.getenv("SQLITECRAWLER_DATA", os.path.abspath("./data"))
@@ -95,6 +95,9 @@ class CrawlLimits:
     max_pages: int = int(os.getenv("SQLITECRAWLER_MAX_PAGES", "0"))  # 0 = no limit
     max_depth: int = int(os.getenv("SQLITECRAWLER_MAX_DEPTH", "3"))
     same_host_only: bool = os.getenv("SQLITECRAWLER_SAME_HOST_ONLY", "1") == "1"
+    path_restriction: str = os.getenv("SQLITECRAWLER_PATH_RESTRICTION", "")  # e.g., "/en-za/" - only crawl URLs containing this path
+    path_exclude_prefixes: list[str] = field(default_factory=lambda: [p.strip() for p in os.getenv("SQLITECRAWLER_PATH_EXCLUDE", "").split(",") if p.strip()])
+    allowed_domains: list[str] = field(default_factory=lambda: [d.strip().lower() for d in os.getenv("SQLITECRAWLER_ALLOWED_DOMAINS", "").split(",") if d.strip()])
 
 def get_website_db_name(url: str) -> str:
     """Extract domain from URL and create a safe database name by replacing dots with underscores."""

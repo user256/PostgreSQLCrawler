@@ -1020,6 +1020,142 @@ async def frontier_mark_done(urls: List[str], base_domain: str, config: Database
             await conn.commit()
 
 
+async def frontier_clean_excluded_urls(
+    base_domain: str,
+    path_exclude_prefixes: list[str] = None,
+    path_restriction: str = "",
+    allowed_domains: list[str] = None,
+    config: DatabaseConfig = None
+) -> int:
+    """Remove excluded URLs from the frontier queue at crawl start.
+    
+    Marks URLs as 'done' if they match exclusion patterns, so they won't be crawled.
+    This ensures that when users add new exclusion rules, existing queued URLs are automatically cleaned.
+    
+    Args:
+        base_domain: Base domain for URL classification
+        path_exclude_prefixes: List of path prefixes to exclude
+        path_restriction: Path restriction string (URLs must contain this)
+        allowed_domains: List of allowed domain suffixes
+        config: Database configuration
+    
+    Returns:
+        Number of URLs marked as done
+    """
+    if config is None:
+        config = get_database_config()
+    
+    if not path_exclude_prefixes and not path_restriction and not allowed_domains:
+        return 0  # No exclusions to apply
+    
+    from urllib.parse import urlparse
+    
+    if config.backend == "postgresql":
+        async with create_connection() as conn:
+            # Get all queued URLs
+            query = """
+            SELECT u.url, f.url_id
+            FROM frontier f
+            JOIN urls u ON f.url_id = u.id
+            WHERE f.status = 'queued'
+            """
+            rows = await conn.fetchall(query)
+            
+            excluded_url_ids = []
+            for row in rows:
+                url = row[0]
+                url_id = row[1]
+                parsed = urlparse(url)
+                path_val = parsed.path or "/"
+                host = parsed.netloc.lower()
+                
+                # Check path exclusions
+                if path_exclude_prefixes:
+                    for prefix in path_exclude_prefixes:
+                        normalized_prefix = prefix if prefix.startswith("/") else f"/{prefix}"
+                        if path_val.startswith(normalized_prefix):
+                            excluded_url_ids.append(url_id)
+                            break
+                    if url_id in excluded_url_ids:
+                        continue
+                
+                # Check path restriction
+                if path_restriction and path_restriction not in path_val:
+                    excluded_url_ids.append(url_id)
+                    continue
+                
+                # Check allowed domains
+                if allowed_domains:
+                    if not any(host == d or host.endswith(f".{d}") for d in allowed_domains):
+                        excluded_url_ids.append(url_id)
+                        continue
+            
+            if excluded_url_ids:
+                current_time = int(time.time())
+                update_query = """
+                UPDATE frontier 
+                SET status = 'done', updated_at = $1
+                WHERE url_id = ANY($2::bigint[]) AND status = 'queued'
+                """
+                await conn.execute(update_query, current_time, excluded_url_ids)
+                await conn.commit()
+                return len(excluded_url_ids)
+            
+            return 0
+    else:
+        # SQLite
+        async with create_connection() as conn:
+            # Get all queued URLs
+            query = """
+            SELECT u.url, f.url_id
+            FROM frontier f
+            JOIN urls u ON f.url_id = u.id
+            WHERE f.status = 'queued'
+            """
+            rows = await conn.fetchall(query)
+            
+            excluded_url_ids = []
+            for row in rows:
+                url = row[0]
+                url_id = row[1]
+                parsed = urlparse(url)
+                path_val = parsed.path or "/"
+                host = parsed.netloc.lower()
+                
+                # Check path exclusions
+                if path_exclude_prefixes:
+                    for prefix in path_exclude_prefixes:
+                        normalized_prefix = prefix if prefix.startswith("/") else f"/{prefix}"
+                        if path_val.startswith(normalized_prefix):
+                            excluded_url_ids.append(url_id)
+                            break
+                    if url_id in excluded_url_ids:
+                        continue
+                
+                # Check path restriction
+                if path_restriction and path_restriction not in path_val:
+                    excluded_url_ids.append(url_id)
+                    continue
+                
+                # Check allowed domains
+                if allowed_domains:
+                    if not any(host == d or host.endswith(f".{d}") for d in allowed_domains):
+                        excluded_url_ids.append(url_id)
+                        continue
+            
+            if excluded_url_ids:
+                current_time = int(time.time())
+                for url_id in excluded_url_ids:
+                    await conn.execute(
+                        "UPDATE frontier SET status = 'done', updated_at = ? WHERE url_id = ? AND status = 'queued'",
+                        current_time, url_id
+                    )
+                await conn.commit()
+                return len(excluded_url_ids)
+            
+            return 0
+
+
 async def frontier_reset_all_pending_to_queued(config: DatabaseConfig = None, max_reset_attempts: int = 5) -> int:
     """Reset all URLs stuck in 'pending' status back to 'queued'.
     

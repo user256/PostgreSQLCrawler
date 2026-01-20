@@ -17,6 +17,9 @@ python3 main.py https://example.com --max-pages 100 --max-depth 3
 # Crawl comparison (origin vs staging)
 python3 main.py https://example.com --compare-domain https://staging.example.com
 
+# Crawl only a specific folder/section
+python3 main.py https://www.livescore.com/en-za/ --path-restriction /en-za/
+
 # To use curl_cffi like in the benchmarks:
 python3 main.py https://example.com --http-backend curl
 
@@ -56,6 +59,7 @@ venv/bin/python main.py https://whiskipedia.com --http-backend curl
 - **Schema.org Extraction**: Extracts and validates JSON-LD, microdata, and RDFa structured data
 - **Hreflang Support**: Extracts and normalizes hreflang data from sitemaps
 - **CSV Crawl Support**: Crawl from predefined URL lists with restricted or seed modes
+- **Path Restriction**: Crawl only specific folders/sections of a website
 
 ### **Crawl Comparison** 🆕
 - **Origin vs Staging**: Compare production and staging environments
@@ -376,6 +380,62 @@ python main.py https://example.com --compare-domain https://staging.example.com 
 - `--max-pages`: Maximum pages to crawl (default: unlimited)
 - `--max-depth`: Maximum crawl depth (default: 3)
 - `--offsite`: Allow offsite traversal (default: same host only)
+- `--path-restriction`: Only crawl URLs containing this path (see below)
+- `--path-exclude`: Comma-separated path prefixes to skip entirely (see below)
+- `--allow-domains`: Comma-separated allowed domains/subdomains (host suffix match). URLs whose host is not in this list are skipped (recorded only).
+
+### **Path Restriction** 🆕
+
+Restrict crawling to a specific folder/section of a website. URLs outside the path are recorded but not crawled (treated as external).
+
+```bash
+# Only crawl URLs containing /en-za/
+python main.py https://www.livescore.com/en-za/ --path-restriction /en-za/
+
+# Only crawl the /blog/ section
+python main.py https://example.com/blog/ --path-restriction /blog/
+```
+
+**What happens:**
+- ✅ Sitemaps are still scraped and all URLs discovered
+- ✅ URLs containing the path string are crawled normally
+- ❌ URLs NOT containing the path are recorded but not followed
+
+**Example with `/en-za/`:**
+| URL | Action |
+|-----|--------|
+| `/en-za/football/` | ✅ Crawled |
+| `/en-za/tennis/live/` | ✅ Crawled |
+| `/en-gb/football/` | ❌ Recorded only |
+| `/about/` | ❌ Recorded only |
+
+### **Path Exclusions** 🆕
+
+Skip specific path prefixes while still recording them (useful when you want to ignore news/blog sections).
+
+```bash
+# Crawl site but skip paths
+python main.py https://example.com --path-exclude "/news/,/blog"
+
+# Combine with path restriction (only crawl /en/ and skip news/blog)
+python main.py https://example.com --path-restriction /en/ --path-exclude "/en/news/,/en/blog"
+```
+
+**What happens:**
+- ✅ URLs outside those prefixes are crawled normally
+- ❌ URLs whose path starts with any excluded prefix are marked done immediately (recorded but not fetched)
+
+### **Allowed Domains/Subdomains** 🆕
+
+Restrict crawling to a specific set of domains or subdomains (suffix match). URLs outside this set are recorded but not crawled unless `--allow-external` is set.
+
+```bash
+# Stay on casino.org and all its subdomains
+python main.py https://www.casino.org --allow-domains "casino.org"
+
+# Only allow en and uk subdomains
+python main.py https://www.casino.org --allow-domains "en.casino.org,uk.casino.org"
+```
 
 ### **HTTP Configuration**
 - `--concurrency`: Maximum concurrent requests (default: 10)

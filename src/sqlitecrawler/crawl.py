@@ -2,11 +2,13 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+import threading
 import time
 from urllib.parse import urlsplit, urlparse, urlunparse
 from typing import Iterable, Tuple, List, Optional, Dict
 from concurrent.futures import ThreadPoolExecutor
 from .config import HttpConfig, CrawlLimits, get_db_paths, get_database_config
+from .database import set_global_config
 from .db_operations import (
     init_pages_db,
     init_crawl_db,
@@ -67,16 +69,59 @@ def normalize_headers(headers: dict) -> dict:
             normalized[key_lower] = str(value).strip()
     return normalized
 
-def should_crawl_url(url: str, base_domain: str, allow_external: bool, is_from_sitemap: bool = False, is_from_hreflang: bool = False, user_agent: str = "SQLiteCrawler/0.2", csv_urls: list = None, csv_seed_mode: bool = False) -> bool:
-    """Determine if a URL should be crawled based on classification and settings."""
+def should_crawl_url(
+    url: str,
+    base_domain: str,
+    allow_external: bool,
+    is_from_sitemap: bool = False,
+    is_from_hreflang: bool = False,
+    user_agent: str = "SQLiteCrawler/0.2",
+    csv_urls: list = None,
+    csv_seed_mode: bool = False,
+    path_restriction: str = "",
+    path_exclude_prefixes: list[str] | None = None,
+    allowed_domains: list[str] | None = None,
+) -> bool:
+    """Determine if a URL should be crawled based on classification and settings.
+    
+    Args:
+        path_restriction: If set, URLs that don't contain this path string are treated as external.
+                         Example: "/en-za/" would only crawl URLs containing "/en-za/".
+    """
     from .db import classify_url
     from .robots import is_url_crawlable
+    from urllib.parse import urlparse
     
     # In CSV restricted mode, only crawl URLs that are in the CSV list
     if csv_urls and not csv_seed_mode:
         return url in csv_urls
     
     classification = classify_url(url, base_domain, is_from_sitemap, is_from_hreflang)
+    
+    parsed = urlparse(url)
+    path_val = parsed.path or "/"
+
+    # Check path exclusions FIRST for ALL URL types (before other checks)
+    # This ensures excluded paths are never crawled regardless of classification
+    if path_exclude_prefixes:
+        for prefix in path_exclude_prefixes:
+            normalized_prefix = prefix if prefix.startswith("/") else f"/{prefix}"
+            if path_val.startswith(normalized_prefix):
+                return False
+
+    # If allowed domains are set, restrict to those hosts (suffix match for subdomains)
+    if allowed_domains:
+        host = parsed.netloc.lower()
+        if not any(host == d or host.endswith(f".{d}") for d in allowed_domains):
+            # Treat as external; only crawl if external allowed
+            return allow_external
+
+    # If path restriction is set, check if URL contains the path
+    # URLs outside the path restriction are treated as external (recorded but not crawled)
+    if path_restriction and classification == 'internal':
+        if path_restriction not in parsed.path:
+            # Treat as external - will be recorded but not crawled unless allow_external is True
+            return allow_external
     
     # Always crawl internal URLs (but check robots.txt)
     if classification == 'internal':
@@ -208,14 +253,31 @@ async def fetch_with_delay(url: str, cfg: HttpConfig, delay_tracker: HostDelayTr
     
     # Make the request
     start_time = time.time()
-    result = await fetch_with_redirect_tracking(url, cfg, conditional_headers)
-    response_time = time.time() - start_time
-    
-    # Update delay based on response
-    status_code = result[0]
-    delay_tracker.update_delay_for_host(host, status_code, response_time)
-    
-    return result
+    try:
+        result = await fetch_with_redirect_tracking(url, cfg, conditional_headers)
+        response_time = time.time() - start_time
+        
+        # Update delay based on response
+        status_code = result[0]
+        delay_tracker.update_delay_for_host(host, status_code, response_time)
+        
+        return result
+    except Exception as e:
+        # Catch timeout errors, connection errors, and other exceptions
+        # Return a failed result (status 0) so the crawler can continue
+        import json
+        error_msg = str(e)
+        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+            print(f"  -> Timeout fetching {url}: {error_msg}")
+        else:
+            print(f"  -> Error fetching {url}: {error_msg}")
+        
+        # Update delay tracker with failure (status 0 indicates failure)
+        response_time = time.time() - start_time
+        delay_tracker.update_delay_for_host(host, 0, response_time)
+        
+        # Return failed result: (status, final_url, headers, text, original_url, redirect_chain_json)
+        return (0, url, {}, "", url, json.dumps([]))
 
 async def fetch_many_with_delay(urls: List[str], cfg: HttpConfig, delay_tracker: HostDelayTracker, base_domain: str = None, pages_db_path: str = None, crawl_db_path: str = None) -> List[Tuple[int, str, Dict[str, str], str, str, str]]:
     """Fetch multiple URLs with adaptive delay, processing them sequentially to respect delays."""
@@ -263,9 +325,10 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
     """
     global shutdown_requested, force_quit
     
-    # Set up signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Set up signal handlers for graceful shutdown (only in main thread)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
     
     cfg = http_config or HttpConfig()
     limits = limits or CrawlLimits()
@@ -290,6 +353,9 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
     
     # Get database configuration
     db_config = get_database_config(start)
+    
+    # Set global config so functions like create_connection() can use it
+    set_global_config(db_config)
     
     # Only get SQLite paths if using SQLite backend
     if db_config.backend == "postgresql":
@@ -445,6 +511,19 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
         # Backfill any URLs that are in urls table but not in frontier (unknown status)
         await backfill_missing_frontier_entries(base_domain, db_config)
 
+    # Clean excluded URLs from frontier queue (automatically remove URLs matching exclusion patterns)
+    if limits.path_exclude_prefixes or limits.path_restriction or limits.allowed_domains:
+        from .db_operations import frontier_clean_excluded_urls
+        excluded_count = await frontier_clean_excluded_urls(
+            base_domain,
+            path_exclude_prefixes=limits.path_exclude_prefixes,
+            path_restriction=limits.path_restriction,
+            allowed_domains=limits.allowed_domains,
+            config=db_config
+        )
+        if excluded_count > 0:
+            print(f"Cleaned {excluded_count} excluded URLs from frontier queue")
+
     processed = 0
     next_batch_cache = None  # Initialize prefetched batch storage
     
@@ -574,13 +653,50 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
         # We'll use the normalized URLs directly since they should work for fetching
         # Use redirect tracking to capture redirect chains with adaptive delay
         
-        # Filter URLs based on circuit breaker state
+        # Initialize lists for batch processing (needed early for path/path-exclude filtering)
+        to_mark_done = []
+        
+        # Filter URLs based on path restriction/exclusion and circuit breaker state
         urls_to_fetch = []
         skipped_urls = []
+        path_restricted_urls = []
+        path_excluded_urls = []
+        domain_filtered_urls = []
         
         for url in urls:
             from urllib.parse import urlparse
-            host = urlparse(url).netloc.lower()
+            parsed_url = urlparse(url)
+            host = parsed_url.netloc.lower()
+            
+            # Allowed domains filter (host suffix match)
+            if limits.allowed_domains:
+                host = parsed_url.netloc.lower()
+                if not any(host == d or host.endswith(f".{d}") for d in limits.allowed_domains):
+                    domain_filtered_urls.append(url)
+                    to_mark_done.append(url)
+                    continue
+
+            # Check path restriction FIRST - if URL doesn't match, mark as done and skip
+            if limits.path_restriction and limits.path_restriction not in parsed_url.path:
+                path_restricted_urls.append(url)
+                # Mark as done so it's not retried, but don't crawl it
+                to_mark_done.append(url)
+                continue
+
+            # Check path exclusions - skip any URL whose path starts with a blocked prefix
+            if limits.path_exclude_prefixes:
+                path_val = parsed_url.path or "/"
+                excluded = False
+                for prefix in limits.path_exclude_prefixes:
+                    normalized_prefix = prefix if prefix.startswith("/") else f"/{prefix}"
+                    if path_val.startswith(normalized_prefix):
+                        excluded = True
+                        break
+                if excluded:
+                    path_excluded_urls.append(url)
+                    to_mark_done.append(url)
+                    continue
+            
             breaker = circuit_breaker_registry.get_breaker(host)
             
             if breaker.allow_request():
@@ -591,6 +707,14 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
                 # We should probably mark these as failed or retry later?
                 # For now, let's just log it. In a real system, we might want to re-queue them with a delay.
         
+        # Log path-restricted/excluded URLs if any
+        if domain_filtered_urls:
+            print(f"  -> Skipped {len(domain_filtered_urls)} URLs outside allowed domains {limits.allowed_domains}")
+        if path_restricted_urls:
+            print(f"  -> Skipped {len(path_restricted_urls)} URLs outside path restriction '{limits.path_restriction}'")
+        if path_excluded_urls:
+            print(f"  -> Skipped {len(path_excluded_urls)} URLs due to excluded path prefixes: {limits.path_exclude_prefixes}")
+        
         # Debug: Log what we're about to fetch
         print(f"  -> DEBUG: About to fetch {len(urls_to_fetch)} URLs: {urls_to_fetch[:5]}..." if len(urls_to_fetch) > 5 else f"  -> DEBUG: About to fetch {len(urls_to_fetch)} URLs: {urls_to_fetch}")
         
@@ -599,7 +723,7 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
         # Debug: Log what we got back
         print(f"  -> DEBUG: fetch_many_with_delay returned {len(results)} results")
 
-        to_mark_done = []
+        # Continue initializing batch processing lists (to_mark_done already initialized above for path restriction)
         to_enqueue = []
         pages_to_write = []
         urls_to_upsert = []
@@ -724,7 +848,7 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
                             urls_to_upsert.append((final_norm, k, base_domain, original_norm))
                             
                             # If the final URL should be crawled and isn't already in frontier, enqueue it
-                            if should_crawl_url(final_norm, base_domain, allow_external, is_from_sitemap=False, user_agent=http_config.user_agent, csv_urls=csv_urls, csv_seed_mode=csv_seed_mode):
+                            if should_crawl_url(final_norm, base_domain, allow_external, is_from_sitemap=False, user_agent=http_config.user_agent, csv_urls=csv_urls, csv_seed_mode=csv_seed_mode, path_restriction=limits.path_restriction, path_exclude_prefixes=limits.path_exclude_prefixes, allowed_domains=limits.allowed_domains):
                                 # Use same depth as original (redirects don't increase depth)
                                 children_to_enqueue.append((final_norm, depth, original_norm, base_domain))
                 except json.JSONDecodeError:
@@ -740,15 +864,18 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
                         child_norm = normalize_url_for_storage(child)
                         
                         # Check if URL should be crawled based on classification
-                        if should_crawl_url(child_norm, base_domain, allow_external, is_from_sitemap=True, user_agent=http_config.user_agent, csv_urls=csv_urls, csv_seed_mode=csv_seed_mode):
+                        if should_crawl_url(child_norm, base_domain, allow_external, is_from_sitemap=True, user_agent=http_config.user_agent, csv_urls=csv_urls, csv_seed_mode=csv_seed_mode, path_restriction=limits.path_restriction, path_exclude_prefixes=limits.path_exclude_prefixes, allowed_domains=limits.allowed_domains):
                             children_to_enqueue.append((child_norm, depth + 1, original_norm, base_domain))
                             # Don't log here - logging happens after filtering in batch_enqueue_frontier
                         else:
-                            # Record but don't crawl
+                            # Record but don't crawl (outside path restriction or external)
                             urls_to_upsert.append((child_norm, "other", base_domain, original_norm))
                             from .db import classify_url
                             classification = classify_url(child_norm, base_domain, is_from_sitemap=True)
-                            print(f"  -> {classification.title()} URL from sitemap recorded: {child_norm}")
+                            if limits.path_restriction and limits.path_restriction not in child_norm:
+                                print(f"  -> Internal URL outside path restriction recorded: {child_norm}")
+                            else:
+                                print(f"  -> {classification.title()} URL from sitemap recorded: {child_norm}")
             elif k == "html":
                 urls_to_upsert.append((original_norm, "html", base_domain, parent_norm or normalize_url_for_storage(start)))
                 # Always write page record, even if no text (e.g., for redirects)
@@ -790,16 +917,13 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
                             child_norm = normalize_url_for_storage(child)
                             
                             # Check if URL should be crawled based on classification
-                            if should_crawl_url(child_norm, base_domain, allow_external, is_from_sitemap=False, user_agent=http_config.user_agent, csv_urls=csv_urls, csv_seed_mode=csv_seed_mode):
+                            if should_crawl_url(child_norm, base_domain, allow_external, is_from_sitemap=False, user_agent=http_config.user_agent, csv_urls=csv_urls, csv_seed_mode=csv_seed_mode, path_restriction=limits.path_restriction, path_exclude_prefixes=limits.path_exclude_prefixes, allowed_domains=limits.allowed_domains):
                                 children_to_enqueue.append((child_norm, depth + 1, original_norm, base_domain))
                                 # Don't log here - logging happens after filtering in batch_enqueue_frontier
                             else:
-                                # Record but don't crawl
+                                # Record but don't crawl (outside path restriction or external)
                                 urls_to_upsert.append((child_norm, "other", base_domain, original_norm))
-                                from .db import classify_url
-                                classification = classify_url(child_norm, base_domain, is_from_sitemap=False)
                                 # Don't log external/social URLs to keep crawl output clean
-                                # print(f"  -> {classification.title()} URL recorded: {child_norm}")
                     elif csv_urls and not csv_seed_mode:
                         # In CSV restricted mode, just record links but don't follow them
                         for child in links:
@@ -951,8 +1075,19 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
                 next_batch_cache = None
         
         processed += len(results)
+        # Count path-filtered URLs towards total (they're marked done but not crawled)
+        processed += len(path_restricted_urls) + len(path_excluded_urls) + len(domain_filtered_urls)
         
-        print(f"Batch complete: processed {len(results)} URLs, enqueued {actually_enqueued} new URLs")
+        if path_restricted_urls or path_excluded_urls or domain_filtered_urls:
+            print(
+                f"Batch complete: processed {len(results)} URLs, "
+                f"skipped {len(domain_filtered_urls)} (domain filtered), "
+                f"skipped {len(path_restricted_urls)} (path restricted), "
+                f"skipped {len(path_excluded_urls)} (path excluded), "
+                f"enqueued {actually_enqueued} new URLs"
+            )
+        else:
+            print(f"Batch complete: processed {len(results)} URLs, enqueued {actually_enqueued} new URLs")
         if limits.max_pages > 0:
             print(f"Total processed so far: {processed}/{limits.max_pages}")
         else:
