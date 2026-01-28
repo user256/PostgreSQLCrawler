@@ -312,6 +312,45 @@ CREATE TABLE IF NOT EXISTS schema_data (
   FOREIGN KEY (url_id) REFERENCES urls (id),
   FOREIGN KEY (schema_type_id) REFERENCES schema_types (id)
 );
+
+CREATE TABLE IF NOT EXISTS hsts_preload_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  base_domain TEXT NOT NULL,
+  checked_at INTEGER NOT NULL,
+  https_url TEXT,
+  https_status INTEGER,
+  hsts_header TEXT,
+  hsts_max_age INTEGER,
+  hsts_include_subdomains BOOLEAN,
+  hsts_preload BOOLEAN,
+  hsts_max_age_ok BOOLEAN,
+  http_url TEXT,
+  http_status INTEGER,
+  http_redirects_to_https BOOLEAN,
+  http_redirect_target TEXT,
+  eligible BOOLEAN,
+  notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hsts_preload_checks_domain ON hsts_preload_checks(base_domain);
+
+CREATE TABLE IF NOT EXISTS spa_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  base_domain TEXT NOT NULL,
+  checked_at INTEGER NOT NULL,
+  random_404_url TEXT,
+  random_404_status INTEGER,
+  random_404_final_url TEXT,
+  random_404_ok BOOLEAN,
+  case_url TEXT,
+  case_status INTEGER,
+  case_final_url TEXT,
+  case_redirects BOOLEAN,
+  case_canonical_url TEXT,
+  case_expected_url TEXT,
+  case_ok BOOLEAN,
+  notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_spa_checks_domain ON spa_checks(base_domain);
 """
 
 
@@ -503,6 +542,95 @@ async def init_crawl_db(config: DatabaseConfig, crawl_db_path: str = None):
         # Restore the original config
         if crawl_db_path:
             set_global_config(config)
+
+
+async def write_hsts_preload_check(
+    base_domain: str,
+    check_data: Dict[str, Any],
+    config: DatabaseConfig
+):
+    """Write an HSTS preload check record."""
+    checked_at = check_data.get("checked_at") or int(time.time())
+    values = (
+        base_domain,
+        checked_at,
+        check_data.get("https_url"),
+        check_data.get("https_status"),
+        check_data.get("hsts_header"),
+        check_data.get("hsts_max_age"),
+        check_data.get("hsts_include_subdomains"),
+        check_data.get("hsts_preload"),
+        check_data.get("hsts_max_age_ok"),
+        check_data.get("http_url"),
+        check_data.get("http_status"),
+        check_data.get("http_redirects_to_https"),
+        check_data.get("http_redirect_target"),
+        check_data.get("eligible"),
+        check_data.get("notes"),
+    )
+    if config.backend == "postgresql":
+        query = """
+        INSERT INTO hsts_preload_checks (
+            base_domain, checked_at, https_url, https_status, hsts_header, hsts_max_age,
+            hsts_include_subdomains, hsts_preload, hsts_max_age_ok, http_url, http_status,
+            http_redirects_to_https, http_redirect_target, eligible, notes
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        """
+    else:
+        query = """
+        INSERT INTO hsts_preload_checks (
+            base_domain, checked_at, https_url, https_status, hsts_header, hsts_max_age,
+            hsts_include_subdomains, hsts_preload, hsts_max_age_ok, http_url, http_status,
+            http_redirects_to_https, http_redirect_target, eligible, notes
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """
+    async with create_connection() as conn:
+        await conn.execute(query, *values)
+        await conn.commit()
+
+
+async def write_spa_check(
+    base_domain: str,
+    check_data: Dict[str, Any],
+    config: DatabaseConfig
+):
+    """Write an SPA check record."""
+    checked_at = check_data.get("checked_at") or int(time.time())
+    values = (
+        base_domain,
+        checked_at,
+        check_data.get("random_404_url"),
+        check_data.get("random_404_status"),
+        check_data.get("random_404_final_url"),
+        check_data.get("random_404_ok"),
+        check_data.get("case_url"),
+        check_data.get("case_status"),
+        check_data.get("case_final_url"),
+        check_data.get("case_redirects"),
+        check_data.get("case_canonical_url"),
+        check_data.get("case_expected_url"),
+        check_data.get("case_ok"),
+        check_data.get("notes"),
+    )
+    if config.backend == "postgresql":
+        query = """
+        INSERT INTO spa_checks (
+            base_domain, checked_at, random_404_url, random_404_status, random_404_final_url,
+            random_404_ok, case_url, case_status, case_final_url, case_redirects,
+            case_canonical_url, case_expected_url, case_ok, notes
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        """
+    else:
+        query = """
+        INSERT INTO spa_checks (
+            base_domain, checked_at, random_404_url, random_404_status, random_404_final_url,
+            random_404_ok, case_url, case_status, case_final_url, case_redirects,
+            case_canonical_url, case_expected_url, case_ok, notes
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """
+    async with create_connection() as conn:
+        await conn.execute(query, *values)
+        await conn.commit()
 
 
 async def write_page(url_id: int, headers: dict, html: str, config: DatabaseConfig, pages_db_path: str = None):
@@ -2900,6 +3028,137 @@ async def batch_write_sitemaps_and_urls(sitemap_data: List[Tuple[str, List[Tuple
             # Fallback to default path
             from .config import CRAWL_DB_PATH
             await sqlite_batch_write_sitemaps_and_urls(sitemap_data, CRAWL_DB_PATH)
+
+
+async def batch_write_hreflang_sitemap_data(hreflang_data: List[Tuple[str, str, str]], crawl_db_path: str = None, config: DatabaseConfig = None, base_domain: str = ""):
+    """Write hreflang data from sitemaps to the normalized database structure.
+    
+    Supports both PostgreSQL and SQLite backends.
+    
+    Args:
+        hreflang_data: List of tuples (source_url, hreflang_code, href_url)
+        crawl_db_path: Database path (for SQLite only)
+        config: Database configuration
+        base_domain: Base domain for URL classification
+    """
+    if config is None:
+        config = get_database_config()
+    
+    if not hreflang_data:
+        return
+    
+    if config.backend == "postgresql":
+        from .db import classify_url
+        
+        async with create_connection() as conn:
+            normalized_rows = []
+            source_urls = []
+            target_urls = []
+            hreflang_codes = []
+            
+            for url, hreflang, href_url in hreflang_data:
+                if not url or not hreflang or not href_url:
+                    continue
+                
+                # Normalize protocol-relative URLs
+                normalized_href_url = href_url
+                if href_url.startswith('//'):
+                    if base_domain:
+                        base_protocol = 'https'
+                        normalized_href_url = f"{base_protocol}:{href_url}"
+                    else:
+                        normalized_href_url = f"https:{href_url}"
+                
+                normalized_rows.append((url, hreflang, normalized_href_url))
+                source_urls.append(url)
+                target_urls.append(normalized_href_url)
+                hreflang_codes.append(hreflang)
+            
+            if not normalized_rows:
+                return
+            
+            # Resolve source URL IDs (sitemap URLs should already exist, but ensure they do)
+            unique_source_urls = list(dict.fromkeys(source_urls))
+            source_url_map = await batch_get_or_create_url_ids(unique_source_urls, base_domain, config, conn)
+            
+            # Resolve hreflang language IDs
+            hreflang_to_id = {}
+            unique_hreflang_codes = list(set(hreflang_codes))
+            if unique_hreflang_codes:
+                existing_query = "SELECT id, language_code FROM hreflang_languages WHERE language_code = ANY($1::text[])"
+                existing_result = await conn.fetchall(existing_query, unique_hreflang_codes)
+                hreflang_to_id = {row[1]: row[0] for row in existing_result}
+                
+                missing_codes = [code for code in unique_hreflang_codes if code not in hreflang_to_id]
+                if missing_codes:
+                    insert_query = "INSERT INTO hreflang_languages (language_code) VALUES ($1) ON CONFLICT (language_code) DO NOTHING"
+                    chunk_size = 500
+                    insert_data = [(code,) for code in missing_codes]
+                    for i in range(0, len(insert_data), chunk_size):
+                        await conn.executemany(insert_query, insert_data[i:i + chunk_size])
+                    
+                    fetch_result = await conn.fetchall(existing_query, missing_codes)
+                    for row in fetch_result:
+                        hreflang_to_id[row[1]] = row[0]
+            
+            # Resolve target URL IDs (hreflang href URLs may be new)
+            unique_target_urls = list(dict.fromkeys(target_urls))
+            target_url_map = {}
+            if unique_target_urls:
+                existing_query = "SELECT url, id FROM urls WHERE url = ANY($1::text[])"
+                existing_result = await conn.fetchall(existing_query, unique_target_urls)
+                target_url_map = {row[0]: row[1] for row in existing_result}
+                
+                missing_urls = [url for url in unique_target_urls if url not in target_url_map]
+                if missing_urls:
+                    now = int(time.time())
+                    insert_query = """
+                        INSERT INTO urls (url, kind, classification, is_from_hreflang, first_seen, last_seen)
+                        VALUES ($1, 'other', $2, TRUE, $3, $3)
+                        ON CONFLICT (url) DO UPDATE SET
+                            classification = EXCLUDED.classification,
+                            is_from_hreflang = EXCLUDED.is_from_hreflang
+                    """
+                    insert_data = [
+                        (url, classify_url(url, base_domain, False, True), now)
+                        for url in missing_urls
+                    ]
+                    chunk_size = 500
+                    for i in range(0, len(insert_data), chunk_size):
+                        await conn.executemany(insert_query, insert_data[i:i + chunk_size])
+                    
+                    fetch_result = await conn.fetchall(existing_query, missing_urls)
+                    for row in fetch_result:
+                        target_url_map[row[0]] = row[1]
+            
+            # Insert hreflang sitemap rows in batches
+            insert_rows = []
+            for source_url, hreflang, target_url in normalized_rows:
+                source_url_id = source_url_map.get(source_url)
+                target_url_id = target_url_map.get(target_url)
+                hreflang_id = hreflang_to_id.get(hreflang)
+                if not source_url_id or not target_url_id or not hreflang_id:
+                    continue
+                insert_rows.append((source_url_id, hreflang_id, target_url_id))
+            
+            if insert_rows:
+                insert_query = """
+                    INSERT INTO hreflang_sitemap (url_id, hreflang_id, href_url_id)
+                    VALUES ($1, $2, $3)
+                """
+                chunk_size = 1000
+                for i in range(0, len(insert_rows), chunk_size):
+                    await conn.executemany(insert_query, insert_rows[i:i + chunk_size])
+    else:
+        # SQLite implementation - use the original function
+        from .db import batch_write_hreflang_sitemap_data as sqlite_batch_write_hreflang_sitemap_data
+        db_path = crawl_db_path if crawl_db_path else (config.sqlite_path if config and hasattr(config, 'sqlite_path') else None)
+        if db_path:
+            await sqlite_batch_write_hreflang_sitemap_data(hreflang_data, db_path, base_domain)
+        else:
+            # Fallback to default path
+            from .config import CRAWL_DB_PATH
+            await sqlite_batch_write_hreflang_sitemap_data(hreflang_data, CRAWL_DB_PATH, base_domain)
 
 
 async def add_hreflang_urls_to_frontier(crawl_db_path: str = None, base_domain: str = "", config: DatabaseConfig = None):

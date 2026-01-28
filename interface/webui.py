@@ -9,7 +9,7 @@ import threading
 import uuid
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 from pathlib import Path
 from flask import Flask, jsonify, request, Response, render_template_string
 from sqlalchemy import create_engine, text
@@ -132,6 +132,8 @@ DEFAULT_HTML = r"""<!doctype html>
       font-weight: 600;
     }
     .btn.secondary { background: #fff; color: #0f172a; }
+    .btn.toggle { background: #fff; color: #0f172a; border-color: #e2e8f0; }
+    .btn.toggle.active { background: #0f172a; color: #fff; border-color: #0f172a; }
     .status { font-size: 12px; color: #475569; }
     .error { color: #b91c1c; }
     .grid { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
@@ -155,6 +157,18 @@ DEFAULT_HTML = r"""<!doctype html>
     .view-btn:hover { background: #f1f5f9; }
     .view-btn.active { background: #0f172a; color: #fff; border-color: #0f172a; }
     .view-def-btn { margin-top: 8px; }
+    .columns-grid {
+      display: grid;
+      gap: 6px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      margin-top: 6px;
+    }
+    .inline-inputs {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 2fr 1fr;
+      margin-top: 8px;
+    }
   </style>
 </head>
 <body>
@@ -275,6 +289,10 @@ DEFAULT_HTML = r"""<!doctype html>
 
     <div class="card">
       <h2>Views</h2>
+      <div style="display: flex; gap: 8px; align-items: center; margin: 8px 0;">
+        <button class="btn secondary" onclick="exportAllViews()" id="exportAllViewsBtn">Export All Views CSV</button>
+        <span class="status" id="exportAllViewsStatus"></span>
+      </div>
       <div class="views-container" id="viewList"></div>
 
       <div style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-top: 16px;" onclick="toggleTablesSection()">
@@ -296,12 +314,46 @@ DEFAULT_HTML = r"""<!doctype html>
         <h2 style="margin: 0;">Query</h2>
       </div>
       <div id="queryInputContainer" style="display: none;">
-        <textarea id="queryInput" spellcheck="false" placeholder="SELECT * FROM your_view LIMIT 100" style="margin-top: 8px;"></textarea>
-        <div class="actions">
-        <button class="btn" onclick="runQuery()">Run</button>
-        <button class="btn secondary" onclick="exportCsv()" id="exportBtn" style="display: none;">Export CSV</button>
-        <button class="btn secondary" onclick="exportCsvAll()" id="exportAllBtn" style="display: none;">Export All CSV</button>
-        <span class="status" id="queryStatus"></span>
+        <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
+          <button class="btn toggle active" id="simpleModeBtn" onclick="setQueryMode('simple')">Simple</button>
+          <button class="btn toggle" id="advancedModeBtn" onclick="setQueryMode('advanced')">Advanced</button>
+          <span class="status" id="viewRowCount"></span>
+        </div>
+
+        <div id="simpleQueryContainer" style="display: none; margin-top: 8px;">
+          <div class="status">Simple mode builds a SELECT against the selected view/table.</div>
+          <div style="margin-top: 8px;">
+            <strong style="font-size: 12px; display: block; margin-bottom: 4px;">Columns</strong>
+            <label style="display: flex; align-items: center; gap: 6px; font-size: 12px;">
+              <input type="checkbox" id="simpleSelectAll" checked onchange="toggleSelectAllColumns()">
+              Select all
+            </label>
+            <div id="simpleColumns" class="columns-grid"></div>
+          </div>
+          <div class="inline-inputs">
+            <label style="display: flex; flex-direction: column; gap: 4px;">
+              <span>WHERE (optional)</span>
+              <input id="simpleWhere" placeholder="status_code != 200">
+            </label>
+            <label style="display: flex; flex-direction: column; gap: 4px;">
+              <span>LIMIT (optional)</span>
+              <input id="simpleLimit" placeholder="leave blank for all rows">
+            </label>
+          </div>
+          <div class="actions">
+            <button class="btn" onclick="previewSimpleQuery()">Preview</button>
+            <button class="btn secondary" onclick="exportSimpleCsv()" id="simpleExportBtn">Export CSV</button>
+            <span class="status" id="simpleStatus"></span>
+          </div>
+        </div>
+
+        <div id="advancedQueryContainer" style="margin-top: 8px;">
+          <textarea id="queryInput" spellcheck="false" placeholder="SELECT * FROM your_view" style="margin-top: 8px;"></textarea>
+          <div class="actions">
+          <button class="btn" onclick="runQuery()">Run</button>
+          <button class="btn secondary" onclick="exportCsv()" id="exportBtn" style="display: none;">Export CSV</button>
+          <span class="status" id="queryStatus"></span>
+          </div>
         </div>
       </div>
     </div>
@@ -321,13 +373,24 @@ DEFAULT_HTML = r"""<!doctype html>
   const results = document.getElementById('results');
   const metaStatus = document.getElementById('metaStatus');
   const queryStatus = document.getElementById('queryStatus');
+  const viewRowCount = document.getElementById('viewRowCount');
+  const simpleColumns = document.getElementById('simpleColumns');
+  const simpleSelectAll = document.getElementById('simpleSelectAll');
+  const simpleWhere = document.getElementById('simpleWhere');
+  const simpleLimit = document.getElementById('simpleLimit');
+  const simpleStatus = document.getElementById('simpleStatus');
+  const exportAllViewsStatus = document.getElementById('exportAllViewsStatus');
   const backendSelect = document.getElementById('backendSelect');
   const pgDatabase = document.getElementById('pgDatabase');
 
   let viewDefExpanded = false;
+  let currentObjectName = null;
+  let currentObjectType = null;
   let currentViewName = null;
   let lastQueryData = null;
   let crawlRefreshInterval = null;
+  let currentQueryMode = 'simple';
+  let lastRowCount = null;
 
   function showCrawlForm() {
     document.getElementById('crawlForm').style.display = 'block';
@@ -348,6 +411,201 @@ DEFAULT_HTML = r"""<!doctype html>
       container.style.display = 'none';
       toggle.textContent = '▶';
     }
+  }
+
+  function setQueryMode(mode) {
+    currentQueryMode = mode;
+    document.getElementById('simpleModeBtn').classList.toggle('active', mode === 'simple');
+    document.getElementById('advancedModeBtn').classList.toggle('active', mode === 'advanced');
+    document.getElementById('simpleQueryContainer').style.display = mode === 'simple' ? 'block' : 'none';
+    document.getElementById('advancedQueryContainer').style.display = mode === 'advanced' ? 'block' : 'none';
+  }
+
+  function extractSelectFromViewSql(sql) {
+    if (!sql) return '';
+    const trimmed = sql.trim();
+    if (trimmed.toLowerCase().startsWith('select')) {
+      return trimmed.replace(/;+\s*$/, '');
+    }
+    const match = trimmed.match(/create\s+(?:or\s+replace\s+)?view[\s\S]+?\s+as\s+(select[\s\S]*)/i);
+    if (match && match[1]) {
+      return match[1].trim().replace(/;+\s*$/, '');
+    }
+    return trimmed.replace(/;+\s*$/, '');
+  }
+
+  function resetSimpleColumns(columns = []) {
+    simpleColumns.innerHTML = '';
+    simpleSelectAll.checked = true;
+    columns.forEach(col => {
+      const label = document.createElement('label');
+      label.style.display = 'flex';
+      label.style.alignItems = 'center';
+      label.style.gap = '6px';
+      label.style.fontSize = '12px';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = col;
+      checkbox.checked = true;
+      checkbox.addEventListener('change', () => {
+        if (!checkbox.checked) {
+          simpleSelectAll.checked = false;
+        }
+      });
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(col));
+      simpleColumns.appendChild(label);
+    });
+  }
+
+  function toggleSelectAllColumns() {
+    const checked = simpleSelectAll.checked;
+    document.querySelectorAll('#simpleColumns input[type="checkbox"]').forEach(cb => {
+      cb.checked = checked;
+    });
+  }
+
+  function getSelectedColumns() {
+    const selected = [];
+    document.querySelectorAll('#simpleColumns input[type="checkbox"]').forEach(cb => {
+      if (cb.checked) {
+        selected.push(cb.value);
+      }
+    });
+    return selected;
+  }
+
+  function quoteIdentifier(name) {
+    return `"${String(name).replace(/"/g, '""')}"`;
+  }
+
+  function buildSimpleQuery({ preview = false } = {}) {
+    if (!currentObjectName) {
+      throw new Error('Select a view or table first.');
+    }
+    const selectedColumns = getSelectedColumns();
+    const columnsSql = selectedColumns.length
+      ? selectedColumns.map(col => quoteIdentifier(col)).join(', ')
+      : '*';
+    let sql = `SELECT ${columnsSql} FROM ${quoteIdentifier(currentObjectName)}`;
+    const whereClause = simpleWhere.value.trim();
+    if (whereClause) {
+      sql += ` WHERE ${whereClause}`;
+    }
+    const limitValue = simpleLimit.value.trim();
+    if (limitValue) {
+      sql += ` LIMIT ${limitValue}`;
+    } else if (preview) {
+      sql += ' LIMIT 100';
+    }
+    return sql;
+  }
+
+  async function loadSimpleMeta(name) {
+    simpleStatus.textContent = 'Loading columns...';
+    try {
+      const columnsData = await fetchJSON('/api/view-columns?name=' + encodeURIComponent(name));
+      resetSimpleColumns(columnsData.columns || []);
+    } catch (e) {
+      resetSimpleColumns([]);
+      simpleStatus.textContent = 'Failed to load columns';
+      return;
+    }
+    try {
+      const countData = await fetchJSON('/api/view-count?name=' + encodeURIComponent(name));
+      if (typeof countData.count === 'number') {
+        lastRowCount = countData.count;
+        const isLarge = countData.count >= 100000;
+        viewRowCount.textContent = `Rows: ${formatNumber(countData.count)}${isLarge ? ' (large export may be slow)' : ''}`;
+      } else {
+        lastRowCount = null;
+        viewRowCount.textContent = '';
+      }
+    } catch (e) {
+      lastRowCount = null;
+      viewRowCount.textContent = '';
+    }
+    simpleStatus.textContent = '';
+  }
+
+  async function previewSimpleQuery() {
+    simpleStatus.textContent = 'Running...';
+    results.innerHTML = '';
+    try {
+      const sql = buildSimpleQuery({ preview: true });
+      const data = await fetchJSON('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql })
+      });
+      lastQueryData = data;
+      results.innerHTML = renderTable(data.columns, data.rows);
+      simpleStatus.textContent = `Rows: ${data.rows.length}${data.truncated ? ' (truncated)' : ''}`;
+    } catch (e) {
+      results.innerHTML = `<p class="error">${e.message}</p>`;
+      simpleStatus.textContent = 'Error';
+      lastQueryData = null;
+    }
+  }
+
+  async function exportSimpleCsv() {
+    if (!currentObjectName) {
+      alert('Select a view or table first.');
+      return;
+    }
+    if (lastRowCount !== null && lastRowCount >= 100000) {
+      const proceed = confirm(`This export may be slow (${formatNumber(lastRowCount)} rows). Continue?`);
+      if (!proceed) {
+        return;
+      }
+    }
+    const payload = {
+      name: currentObjectName,
+      columns: getSelectedColumns(),
+      where: simpleWhere.value.trim() || null,
+      limit: simpleLimit.value.trim() || null
+    };
+    try {
+      const response = await fetch('/api/export-view', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Export failed');
+      }
+      const blob = await response.blob();
+      downloadBlob(blob, `${currentObjectName}.csv`);
+    } catch (e) {
+      alert('Export failed: ' + e.message);
+    }
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportAllViews() {
+    if (lastRowCount !== null && lastRowCount >= 100000) {
+      const proceed = confirm('Exporting all views can be slow on large datasets. Continue?');
+      if (!proceed) {
+        exportAllViewsStatus.textContent = '';
+        return;
+      }
+    }
+    exportAllViewsStatus.textContent = 'Preparing export...';
+    window.location.href = '/api/export-all-views';
+    setTimeout(() => {
+      exportAllViewsStatus.textContent = '';
+    }, 2000);
   }
 
   function toggleTablesSection() {
@@ -695,6 +953,7 @@ DEFAULT_HTML = r"""<!doctype html>
 
       viewList.innerHTML = '';
       tableSelect.innerHTML = '<option value="">Select a table...</option>';
+      viewRowCount.textContent = '';
 
       const views = data.objects.filter(o => o.type.toLowerCase().includes('view'));
       const tables = data.objects.filter(o => o.type.toLowerCase() === 'table' || o.type.toLowerCase() === 'base table');
@@ -819,13 +1078,17 @@ DEFAULT_HTML = r"""<!doctype html>
 
   async function selectView(name, expandQuery = true) {
     currentViewName = name;
+    currentObjectName = name;
+    currentObjectType = 'view';
 
     // Update active state
     document.querySelectorAll('.view-btn').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.viewName === name);
     });
 
-    queryInput.value = `SELECT * FROM ${name} LIMIT 100`;
+    setQueryMode('simple');
+    simpleWhere.value = '';
+    simpleLimit.value = '';
 
     // Expand query input if collapsed (only if expandQuery is true)
     if (expandQuery) {
@@ -843,18 +1106,24 @@ DEFAULT_HTML = r"""<!doctype html>
       viewDefExpanded = false;
       viewSql.style.display = 'none';
       document.getElementById('viewDefBtn').style.display = 'inline-block';
+      const selectSql = extractSelectFromViewSql(data.sql || '');
+      if (selectSql) {
+        queryInput.value = selectSql;
+      }
     } catch (e) {
       viewSql.textContent = 'Error loading view definition.';
     }
 
-    // Auto-run the query
-    await runQuery();
+    await loadSimpleMeta(name);
+    await previewSimpleQuery();
   }
 
   async function onTableSelect() {
     const name = tableSelect.value;
     if (name) {
       currentViewName = null;
+      currentObjectName = name;
+      currentObjectType = 'table';
 
       // Clear active state from views
       document.querySelectorAll('.view-btn').forEach(btn => btn.classList.remove('active'));
@@ -867,7 +1136,10 @@ DEFAULT_HTML = r"""<!doctype html>
         tablesToggle.textContent = '▼';
       }
 
-      queryInput.value = `SELECT * FROM ${name} LIMIT 100`;
+      setQueryMode('simple');
+      simpleWhere.value = '';
+      simpleLimit.value = '';
+      queryInput.value = `SELECT * FROM ${name}`;
       
       // Expand query input if collapsed
       const container = document.getElementById('queryInputContainer');
@@ -882,8 +1154,8 @@ DEFAULT_HTML = r"""<!doctype html>
       viewSql.style.display = 'none';
       document.getElementById('viewDefBtn').style.display = 'none';
 
-      // Auto-run the query
-      await runQuery();
+      await loadSimpleMeta(name);
+      await previewSimpleQuery();
     }
   }
 
@@ -901,7 +1173,6 @@ DEFAULT_HTML = r"""<!doctype html>
     queryStatus.textContent = 'Running...';
     results.innerHTML = '';
     document.getElementById('exportBtn').style.display = 'none';
-    document.getElementById('exportAllBtn').style.display = 'none';
 
     try {
       const data = await fetchJSON('/api/query', {
@@ -918,7 +1189,6 @@ DEFAULT_HTML = r"""<!doctype html>
 
       if (data.rows.length > 0) {
         document.getElementById('exportBtn').style.display = 'inline-block';
-        document.getElementById('exportAllBtn').style.display = 'inline-block';
       }
     } catch (e) {
       results.innerHTML = `<p class="error">${e.message}</p>`;
@@ -928,18 +1198,26 @@ DEFAULT_HTML = r"""<!doctype html>
   }
 
   function exportCsv() {
-    if (!lastQueryData || !lastQueryData.rows.length) return;
-    const sql = queryInput.value;
-    window.location.href = `/api/export-csv?sql=${encodeURIComponent(sql)}`;
-  }
-
-  function exportCsvAll() {
-    if (!lastQueryData) return;
-    const sql = queryInput.value;
-    window.location.href = `/api/export-csv-all?sql=${encodeURIComponent(sql)}`;
+    const sql = queryInput.value.trim();
+    if (!sql) return;
+    fetch('/api/export-query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql })
+    })
+      .then(async response => {
+        if (!response.ok) {
+          const err = await response.json();
+          throw new Error(err.error || 'Export failed');
+        }
+        return response.blob();
+      })
+      .then(blob => downloadBlob(blob, 'export.csv'))
+      .catch(err => alert('Export failed: ' + err.message));
   }
 
   // Attempt to auto-load metadata if server already connected via CLI/env
+  setQueryMode('simple');
   loadMeta(true).catch(() => {
     metaStatus.textContent = 'Not connected';
   });
@@ -1028,10 +1306,16 @@ DEFAULT_HTML = r"""<!doctype html>
                   ${crawl.path ? ` • ${escapeHtml(crawl.path)}` : ''}
                 </p>
               </div>
-              <button onclick="dropCrawl('${escapeHtml(crawl.id)}', '${crawl.backend}', '${escapeHtml(crawl.name)}')" 
-                      style="background: #ef4444; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
-                Delete
-              </button>
+              <div style="display: flex; gap: 8px;">
+                <button onclick="connectToCrawl('${escapeHtml(crawl.id)}', '${crawl.backend}', '${escapeHtml(crawl.name)}')"
+                        style="background: #0f172a; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
+                  Open
+                </button>
+                <button onclick="dropCrawl('${escapeHtml(crawl.id)}', '${crawl.backend}', '${escapeHtml(crawl.name)}')" 
+                        style="background: #ef4444; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
+                  Delete
+                </button>
+              </div>
             </div>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 12px;">
               <div>
@@ -1071,6 +1355,32 @@ DEFAULT_HTML = r"""<!doctype html>
       listContainer.innerHTML = errorHtml + html;
     } catch (error) {
       listContainer.innerHTML = `<p style="color: #ef4444;">Error loading crawls: ${error.message}</p>`;
+    }
+  }
+
+  async function connectToCrawl(crawlId, backend, crawlName) {
+    try {
+      metaStatus.textContent = `Connecting to ${crawlName}...`;
+      metaStatus.classList.remove('error');
+      if (backend === 'postgresql') {
+        await fetchJSON('/api/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ db_name: crawlId, db_schema: 'public' })
+        });
+      } else {
+        await fetchJSON('/api/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ db_url: `sqlite:///${crawlId}`, db_schema: 'public' })
+        });
+      }
+      closeManageCrawls();
+      await loadMeta(false);
+      metaStatus.textContent = `Connected to ${crawlName}`;
+    } catch (e) {
+      metaStatus.textContent = 'Connect failed: ' + e.message;
+      metaStatus.classList.add('error');
     }
   }
 
@@ -1318,6 +1628,74 @@ def ensure_limit(sql: str, limit: int = 200) -> str:
     # No limit found, add default
     return f"{sql_no_trailing} LIMIT {limit}"
 
+
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def is_safe_identifier(name: str) -> bool:
+    return bool(IDENTIFIER_RE.match(name or ""))
+
+
+def quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def qualify_name(engine: Engine, schema: str, name: str) -> str:
+    if detect_backend(engine) == "postgresql":
+        return f"{quote_ident(schema)}.{quote_ident(name)}"
+    return quote_ident(name)
+
+
+def get_allowed_objects(engine: Engine, schema: str) -> set[str]:
+    objects = list_objects(engine, schema)
+    return {obj["name"] for obj in objects}
+
+
+def get_object_columns(engine: Engine, schema: str, name: str) -> List[str]:
+    backend = detect_backend(engine)
+    if backend == "postgresql":
+        q = text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = :schema AND table_name = :name
+            ORDER BY ordinal_position
+            """
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(q, {"schema": schema, "name": name}).fetchall()
+        return [r[0] for r in rows]
+    q = text(f'PRAGMA table_info({quote_ident(name)})')
+    with engine.connect() as conn:
+        rows = conn.execute(q).fetchall()
+    return [r[1] for r in rows]
+
+
+def get_object_count(engine: Engine, schema: str, name: str) -> int:
+    qualified = qualify_name(engine, schema, name)
+    with engine.connect() as conn:
+        row = conn.execute(text(f"SELECT COUNT(*) FROM {qualified}")).fetchone()
+    return int(row[0]) if row else 0
+
+
+def stream_csv(result) -> Iterable[str]:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(list(result.keys()))
+    yield output.getvalue()
+    output.seek(0)
+    output.truncate(0)
+
+    for row in result:
+        writer.writerow(list(row))
+        if output.tell() >= 65536:
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+
+    if output.tell():
+        yield output.getvalue()
+
 def run_query(engine: Engine, sql: str, max_rows: int = 10000) -> Tuple[List[str], List[List[Any]], bool]:
     if not is_select_only(sql):
         raise ValueError("Only single SELECT statements are allowed, without semicolons.")
@@ -1401,6 +1779,43 @@ def create_app(
         sql = get_view_sql(state["engine"], name, state["schema"])
         return jsonify({"sql": sql})
 
+    @app.route("/api/view-columns")
+    def view_columns():
+        if not check_auth():
+            return unauthorized()
+        if not state.get("engine"):
+            return jsonify({"error": "not connected"}), 400
+        name = request.args.get("name")
+        if not name:
+            return jsonify({"error": "name required"}), 400
+        if not is_safe_identifier(name):
+            return jsonify({"error": "invalid name"}), 400
+        allowed = get_allowed_objects(state["engine"], state["schema"])
+        if name not in allowed:
+            return jsonify({"error": "unknown object"}), 400
+        columns = get_object_columns(state["engine"], state["schema"], name)
+        return jsonify({"columns": columns})
+
+    @app.route("/api/view-count")
+    def view_count():
+        if not check_auth():
+            return unauthorized()
+        if not state.get("engine"):
+            return jsonify({"error": "not connected"}), 400
+        name = request.args.get("name")
+        if not name:
+            return jsonify({"error": "name required"}), 400
+        if not is_safe_identifier(name):
+            return jsonify({"error": "invalid name"}), 400
+        allowed = get_allowed_objects(state["engine"], state["schema"])
+        if name not in allowed:
+            return jsonify({"error": "unknown object"}), 400
+        try:
+            count = get_object_count(state["engine"], state["schema"], name)
+            return jsonify({"count": count})
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": f"count failed: {e}"}), 500
+
     @app.route("/api/query", methods=["POST"])
     def query():
         if not check_auth():
@@ -1436,15 +1851,16 @@ def create_app(
         if not sql:
             return jsonify({"error": "sql required"}), 400
         try:
-            # Run query with default limit (current results)
-            columns, rows, _ = run_query(state["engine"], sql)
-            csv_content = generate_csv(columns, rows)
-            response = Response(
-                csv_content,
-                mimetype="text/csv",
-                headers={"Content-Disposition": "attachment; filename=export.csv"},
-            )
-            return response
+            if not is_select_only(sql):
+                raise ValueError("Only single SELECT statements are allowed, without semicolons.")
+            with state["engine"].connect() as conn:
+                result = conn.execute(text(sql))
+                response = Response(
+                    stream_csv(result),
+                    mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=export.csv"},
+                )
+                return response
         except ValueError as ve:
             return jsonify({"error": str(ve)}), 400
         except Exception as e:  # noqa: BLE001
@@ -1460,33 +1876,149 @@ def create_app(
         if not sql:
             return jsonify({"error": "sql required"}), 400
         try:
-            # Remove any existing LIMIT clause to get all rows
             sql_clean = sql.rstrip().rstrip(";").rstrip()
             sql_lower = sql_clean.lower()
             if " limit " in sql_lower:
-                # Find and remove LIMIT clause (including LIMIT ALL)
                 sql_clean = re.sub(r'\s+LIMIT\s+(\d+|ALL)', '', sql_clean, flags=re.IGNORECASE)
 
-            # Execute query directly without any limit restrictions
             if not is_select_only(sql_clean):
                 raise ValueError("Only single SELECT statements are allowed, without semicolons.")
 
             with state["engine"].connect() as conn:
                 result = conn.execute(text(sql_clean))
-                columns = list(result.keys())
-                rows = result.fetchall()
-
-            # Convert rows to plain lists for CSV
-            rows_list = [list(r) for r in rows]
-            csv_content = generate_csv(columns, rows_list)
-            response = Response(
-                csv_content,
-                mimetype="text/csv",
-                headers={"Content-Disposition": "attachment; filename=export_all.csv"},
-            )
-            return response
+                response = Response(
+                    stream_csv(result),
+                    mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=export_all.csv"},
+                )
+                return response
         except ValueError as ve:
             return jsonify({"error": str(ve)}), 400
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": f"export failed: {e}"}), 500
+
+    @app.route("/api/export-query", methods=["POST"])
+    def export_query():
+        if not check_auth():
+            return unauthorized()
+        if not state.get("engine"):
+            return jsonify({"error": "not connected"}), 400
+        payload = request.get_json(force=True, silent=True) or {}
+        sql = payload.get("sql", "")
+        if not sql:
+            return jsonify({"error": "sql required"}), 400
+        try:
+            if not is_select_only(sql):
+                raise ValueError("Only single SELECT statements are allowed, without semicolons.")
+            with state["engine"].connect() as conn:
+                result = conn.execute(text(sql))
+                response = Response(
+                    stream_csv(result),
+                    mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=export.csv"},
+                )
+                return response
+        except ValueError as ve:
+            return jsonify({"error": str(ve)}), 400
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": f"export failed: {e}"}), 500
+
+    @app.route("/api/export-view", methods=["POST"])
+    def export_view():
+        if not check_auth():
+            return unauthorized()
+        if not state.get("engine"):
+            return jsonify({"error": "not connected"}), 400
+        payload = request.get_json(force=True, silent=True) or {}
+        name = payload.get("name")
+        if not name:
+            return jsonify({"error": "name required"}), 400
+        if not is_safe_identifier(name):
+            return jsonify({"error": "invalid name"}), 400
+        allowed = get_allowed_objects(state["engine"], state["schema"])
+        if name not in allowed:
+            return jsonify({"error": "unknown object"}), 400
+        columns = payload.get("columns") or []
+        where_clause = payload.get("where")
+        limit = payload.get("limit")
+
+        try:
+            available_columns = get_object_columns(state["engine"], state["schema"], name)
+            if columns:
+                columns = [c for c in columns if c in available_columns]
+            select_cols = "*" if not columns else ", ".join(quote_ident(c) for c in columns)
+            qualified = qualify_name(state["engine"], state["schema"], name)
+            sql = f"SELECT {select_cols} FROM {qualified}"
+            if where_clause:
+                if ";" in where_clause:
+                    raise ValueError("Invalid WHERE clause.")
+                sql += f" WHERE {where_clause}"
+            if limit:
+                try:
+                    limit_value = int(limit)
+                except (ValueError, TypeError):
+                    raise ValueError("Invalid LIMIT value.")
+                sql += f" LIMIT {limit_value}"
+
+            with state["engine"].connect() as conn:
+                result = conn.execute(text(sql))
+                response = Response(
+                    stream_csv(result),
+                    mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={name}.csv"},
+                )
+                return response
+        except ValueError as ve:
+            return jsonify({"error": str(ve)}), 400
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": f"export failed: {e}"}), 500
+
+    @app.route("/api/export-all-views")
+    def export_all_views():
+        if not check_auth():
+            return unauthorized()
+        if not state.get("engine"):
+            return jsonify({"error": "not connected"}), 400
+        try:
+            objects = list_objects(state["engine"], state["schema"])
+            views = [obj["name"] for obj in objects if "view" in obj["type"].lower()]
+            if not views:
+                return jsonify({"error": "no views found"}), 400
+
+            import tempfile
+            import zipfile
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+                zip_path = tmp.name
+
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+                for view_name in views:
+                    qualified = qualify_name(state["engine"], state["schema"], view_name)
+                    with state["engine"].connect() as conn:
+                        result = conn.execute(text(f"SELECT * FROM {qualified}"))
+                        with zipf.open(f"{view_name}.csv", "w") as entry:
+                            output = io.StringIO()
+                            writer = csv.writer(output)
+                            writer.writerow(list(result.keys()))
+                            entry.write(output.getvalue().encode("utf-8"))
+                            output.seek(0)
+                            output.truncate(0)
+                            for row in result:
+                                writer.writerow(list(row))
+                                if output.tell() >= 65536:
+                                    entry.write(output.getvalue().encode("utf-8"))
+                                    output.seek(0)
+                                    output.truncate(0)
+                            if output.tell():
+                                entry.write(output.getvalue().encode("utf-8"))
+
+            response = Response(
+                open(zip_path, "rb"),
+                mimetype="application/zip",
+                headers={"Content-Disposition": "attachment; filename=all_views.zip"},
+            )
+            response.call_on_close(lambda: os.remove(zip_path))
+            return response
         except Exception as e:  # noqa: BLE001
             return jsonify({"error": f"export failed: {e}"}), 500
 
@@ -1816,14 +2348,23 @@ def create_app(
             
             # Get PostgreSQL databases if we have connection info
             current_engine = state.get("engine")
-            if current_engine:
+            if current_engine and detect_backend(current_engine) == "postgresql":
                 try:
-                    engine_url = str(current_engine.url)
+                    databases = []
+                    try:
+                        q = text("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+                        with current_engine.connect() as conn:
+                            result = conn.execute(q)
+                            rows = result.fetchall()
+                            databases = [r[0] for r in rows]
+                    except Exception:
+                        # Fall back to creating a new engine with explicit credentials
+                        engine_url = current_engine.url.render_as_string(hide_password=False)
+                        databases = list_databases(engine_url)
+
+                    engine_url = current_engine.url.render_as_string(hide_password=False)
                     parsed = urlparse(engine_url)
-                    
-                    # Get list of databases using the existing connection
-                    databases = list_databases(engine_url)
-                    
+
                     if not databases:
                         errors.append("No PostgreSQL databases found")
                     else:
@@ -1978,7 +2519,7 @@ def create_app(
             if backend == "postgresql":
                 # Drop PostgreSQL database
                 if state.get("engine"):
-                    engine_url = str(state["engine"].url)
+                    engine_url = state["engine"].url.render_as_string(hide_password=False)
                     parsed = urlparse(engine_url)
                     base_url = f"{parsed.scheme}://{parsed.netloc}"
                     # Connect to postgres database to drop the target database
@@ -1991,13 +2532,20 @@ def create_app(
                         
                         admin_engine = create_db_engine(admin_url, "public")
                         with admin_engine.connect() as conn:
+                            # DROP DATABASE must run outside transactions
+                            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
                             # Terminate connections to the database first (using parameterized query)
-                            conn.execute(text("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :dbname AND pid <> pg_backend_pid()"), {"dbname": crawl_id})
-                            conn.commit()
+                            conn.execute(
+                                text(
+                                    "SELECT pg_terminate_backend(pid) "
+                                    "FROM pg_stat_activity "
+                                    "WHERE datname = :dbname AND pid <> pg_backend_pid()"
+                                ),
+                                {"dbname": crawl_id}
+                            )
                             # Drop the database (identifier must be quoted and validated)
                             quoted_dbname = crawl_id.replace('"', '""')  # Escape double quotes
                             conn.execute(text(f'DROP DATABASE IF EXISTS "{quoted_dbname}"'))
-                            conn.commit()
                         admin_engine.dispose()
                         return jsonify({"success": True, "message": f"Database {crawl_id} dropped successfully"})
                     except Exception as e:

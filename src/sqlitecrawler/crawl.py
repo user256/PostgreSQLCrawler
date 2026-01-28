@@ -1,11 +1,13 @@
 from __future__ import annotations
 import asyncio
+import random
 import signal
 import sys
 import threading
 import time
+import uuid
 from urllib.parse import urlsplit, urlparse, urlunparse
-from typing import Iterable, Tuple, List, Optional, Dict
+from typing import Iterable, Tuple, List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 from .config import HttpConfig, CrawlLimits, get_db_paths, get_database_config
 from .database import set_global_config
@@ -25,14 +27,16 @@ from .db_operations import (
     batch_write_content_with_url_resolution,
     batch_write_internal_links,
     batch_write_redirects,
+    batch_write_hreflang_sitemap_data,
     get_retry_statistics,
     frontier_update_priority_scores,
     filter_done_urls,
+    write_hsts_preload_check,
+    write_spa_check,
 )
 from .db import (
     frontier_enqueue_many,
     batch_write_content,
-    batch_write_hreflang_sitemap_data,
     extract_content_from_html,
 )
 from .db_operations import batch_write_sitemaps_and_urls, backfill_missing_frontier_entries
@@ -68,6 +72,188 @@ def normalize_headers(headers: dict) -> dict:
         if key_lower in {'content-type', 'content-length', 'last-modified', 'etag', 'server'}:
             normalized[key_lower] = str(value).strip()
     return normalized
+
+
+def _get_header_value(headers: dict, header_name: str) -> Optional[str]:
+    if not headers:
+        return None
+    header_map = {k.lower(): v for k, v in headers.items()}
+    return header_map.get(header_name.lower())
+
+
+def _parse_hsts_header(header_value: Optional[str]) -> Dict[str, Any]:
+    max_age = None
+    include_subdomains = False
+    preload = False
+    if header_value:
+        directives = [d.strip() for d in header_value.split(";") if d.strip()]
+        for directive in directives:
+            directive_lower = directive.lower()
+            if directive_lower.startswith("max-age"):
+                parts = directive_lower.split("=", 1)
+                if len(parts) == 2:
+                    try:
+                        max_age = int(parts[1].strip().strip('"'))
+                    except ValueError:
+                        max_age = None
+            elif directive_lower == "includesubdomains":
+                include_subdomains = True
+            elif directive_lower == "preload":
+                preload = True
+    return {
+        "max_age": max_age,
+        "include_subdomains": include_subdomains,
+        "preload": preload,
+        "max_age_ok": max_age is not None and max_age >= 31536000,
+        "present": bool(header_value),
+    }
+
+
+def _randomize_path_case(path: str) -> Tuple[str, bool]:
+    normalized_path = path or "/"
+    chars = list(normalized_path)
+    has_alpha = False
+    for idx, ch in enumerate(chars):
+        if ch.isalpha():
+            has_alpha = True
+            chars[idx] = ch.upper() if random.random() < 0.5 else ch.lower()
+    randomized = "".join(chars)
+    if has_alpha and randomized == normalized_path:
+        for idx, ch in enumerate(chars):
+            if ch.isalpha():
+                chars[idx] = ch.lower() if ch.isupper() else ch.upper()
+                randomized = "".join(chars)
+                break
+    return randomized, has_alpha
+
+
+def _extract_canonical_url(html: str, base_url: str) -> Optional[str]:
+    if not html:
+        return None
+    try:
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+        soup = BeautifulSoup(html, "html.parser")
+        for link in soup.find_all("link"):
+            rel = link.get("rel")
+            if not rel:
+                continue
+            rel_values = [r.lower() for r in rel] if isinstance(rel, list) else [str(rel).lower()]
+            if "canonical" in rel_values:
+                href = link.get("href")
+                if href:
+                    return urljoin(base_url, href.strip())
+    except Exception:
+        return None
+    return None
+
+
+async def run_hsts_preload_check(start_url: str, base_domain: str, cfg: HttpConfig, db_config) -> None:
+    https_url = urlunparse(("https", base_domain, "/", "", "", ""))
+    http_url = urlunparse(("http", base_domain, "/", "", "", ""))
+
+    https_status, https_final_url, https_headers, _, _, _ = await fetch_with_redirect_tracking(https_url, cfg)
+    hsts_header = _get_header_value(https_headers, "strict-transport-security")
+    hsts_data = _parse_hsts_header(hsts_header)
+
+    http_status, http_final_url, _, _, _, _ = await fetch_with_redirect_tracking(http_url, cfg)
+    http_redirects_to_https = False
+    http_redirect_target = None
+    if http_final_url:
+        parsed_final = urlparse(http_final_url)
+        if parsed_final.scheme.lower() == "https":
+            http_redirects_to_https = True
+            http_redirect_target = http_final_url
+
+    eligible = (
+        hsts_data["present"]
+        and hsts_data["max_age_ok"]
+        and hsts_data["include_subdomains"]
+        and hsts_data["preload"]
+        and http_redirects_to_https
+    )
+
+    await write_hsts_preload_check(
+        base_domain,
+        {
+            "checked_at": int(time.time()),
+            "https_url": https_url,
+            "https_status": https_status,
+            "hsts_header": hsts_header,
+            "hsts_max_age": hsts_data["max_age"],
+            "hsts_include_subdomains": hsts_data["include_subdomains"],
+            "hsts_preload": hsts_data["preload"],
+            "hsts_max_age_ok": hsts_data["max_age_ok"],
+            "http_url": http_url,
+            "http_status": http_status,
+            "http_redirects_to_https": http_redirects_to_https,
+            "http_redirect_target": http_redirect_target,
+            "eligible": eligible,
+            "notes": None,
+        },
+        db_config,
+    )
+
+
+async def run_spa_checks(start_url: str, base_domain: str, cfg: HttpConfig, db_config) -> None:
+    parsed = urlparse(start_url)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or base_domain
+    random_path = f"/__sqlitecrawler_spa_check__/{uuid.uuid4().hex}"
+    random_url = urlunparse((scheme, netloc, random_path, "", "", ""))
+
+    rand_status, rand_final_url, _, _, _, _ = await fetch_with_redirect_tracking(random_url, cfg)
+    random_404_ok = rand_status == 404
+
+    case_path, has_alpha = _randomize_path_case(parsed.path or "/")
+    case_url = None
+    case_status = None
+    case_final_url = None
+    case_redirects = None
+    case_canonical_url = None
+    case_ok = None
+    notes = None
+
+    if not has_alpha:
+        notes = "case check skipped: start URL path has no alphabetic characters"
+    else:
+        case_url = urlunparse((scheme, netloc, case_path, parsed.params, parsed.query, parsed.fragment))
+        case_status, case_final_url, _, case_text, _, case_redirect_chain = await fetch_with_redirect_tracking(case_url, cfg)
+        try:
+            import json
+            redirect_steps = json.loads(case_redirect_chain) if case_redirect_chain else []
+            case_redirects = len(redirect_steps) > 1
+        except Exception:
+            case_redirects = False
+        case_canonical_url = _extract_canonical_url(case_text or "", case_final_url or case_url)
+        expected_url = normalize_url_for_storage(start_url)
+        case_final_norm = normalize_url_for_storage(case_final_url or case_url)
+        canonical_norm = normalize_url_for_storage(case_canonical_url) if case_canonical_url else None
+        case_ok = (
+            (case_redirects and case_final_norm == expected_url)
+            or (canonical_norm == expected_url)
+            or (case_final_norm == expected_url)
+        )
+
+    await write_spa_check(
+        base_domain,
+        {
+            "checked_at": int(time.time()),
+            "random_404_url": random_url,
+            "random_404_status": rand_status,
+            "random_404_final_url": rand_final_url,
+            "random_404_ok": random_404_ok,
+            "case_url": case_url,
+            "case_status": case_status,
+            "case_final_url": case_final_url,
+            "case_redirects": case_redirects,
+            "case_canonical_url": case_canonical_url,
+            "case_expected_url": normalize_url_for_storage(start_url),
+            "case_ok": case_ok,
+            "notes": notes,
+        },
+        db_config,
+    )
 
 def should_crawl_url(
     url: str,
@@ -372,6 +558,16 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
     await init_pages_db(db_config, pages_db_path)
     await init_crawl_db(db_config, crawl_db_path)
 
+    try:
+        await run_hsts_preload_check(start, base_domain, cfg, db_config)
+    except Exception as e:
+        print(f"Warning: HSTS preload check failed: {e}")
+
+    try:
+        await run_spa_checks(start, base_domain, cfg, db_config)
+    except Exception as e:
+        print(f"Warning: SPA checks failed: {e}")
+
     # Skip sitemap discovery if requested
     # Initialize sitemap variables
     sitemap_urls = []
@@ -498,7 +694,12 @@ async def crawl(start: str, use_js: bool = False, limits: CrawlLimits | None = N
         
         if hreflang_data_to_write:
             print(f"Writing {len(hreflang_data_to_write)} hreflang entries to database...")
-            await batch_write_hreflang_sitemap_data(hreflang_data_to_write, crawl_db_path, base_domain)
+            await batch_write_hreflang_sitemap_data(
+                hreflang_data_to_write,
+                crawl_db_path=crawl_db_path,
+                config=db_config,
+                base_domain=base_domain
+            )
         
         # Note: We do NOT seed sitemap URLs directly to the frontier
         # Sitemap URLs are stored in the database for reference/prioritization,

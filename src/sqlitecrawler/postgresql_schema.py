@@ -449,6 +449,49 @@ CREATE INDEX IF NOT EXISTS idx_schema_data_url ON schema_data(url_id);
 CREATE INDEX IF NOT EXISTS idx_schema_data_type ON schema_data(schema_type_id);
 CREATE INDEX IF NOT EXISTS idx_schema_data_format ON schema_data(format);
 CREATE INDEX IF NOT EXISTS idx_schema_data_is_valid ON schema_data(is_valid);
+
+-- HSTS preload checks (site-level)
+CREATE TABLE IF NOT EXISTS hsts_preload_checks (
+    id SERIAL PRIMARY KEY,
+    base_domain TEXT NOT NULL,
+    checked_at INTEGER NOT NULL,
+    https_url TEXT,
+    https_status INTEGER,
+    hsts_header TEXT,
+    hsts_max_age INTEGER,
+    hsts_include_subdomains BOOLEAN,
+    hsts_preload BOOLEAN,
+    hsts_max_age_ok BOOLEAN,
+    http_url TEXT,
+    http_status INTEGER,
+    http_redirects_to_https BOOLEAN,
+    http_redirect_target TEXT,
+    eligible BOOLEAN,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_hsts_preload_checks_domain ON hsts_preload_checks(base_domain);
+
+-- SPA checks (site-level)
+CREATE TABLE IF NOT EXISTS spa_checks (
+    id SERIAL PRIMARY KEY,
+    base_domain TEXT NOT NULL,
+    checked_at INTEGER NOT NULL,
+    random_404_url TEXT,
+    random_404_status INTEGER,
+    random_404_final_url TEXT,
+    random_404_ok BOOLEAN,
+    case_url TEXT,
+    case_status INTEGER,
+    case_final_url TEXT,
+    case_redirects BOOLEAN,
+    case_canonical_url TEXT,
+    case_expected_url TEXT,
+    case_ok BOOLEAN,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_spa_checks_domain ON spa_checks(base_domain);
 """
 
 

@@ -483,6 +483,91 @@ SELECT
     MIN(word_count) as min_word_count,
     MAX(word_count) as max_word_count
 FROM content;
+
+-- HSTS preload checks view
+CREATE VIEW IF NOT EXISTS view_hsts_preload_checks AS
+SELECT
+    base_domain,
+    checked_at,
+    https_url,
+    https_status,
+    hsts_header,
+    hsts_max_age,
+    hsts_include_subdomains,
+    hsts_preload,
+    hsts_max_age_ok,
+    http_url,
+    http_status,
+    http_redirects_to_https,
+    http_redirect_target,
+    eligible,
+    notes
+FROM hsts_preload_checks;
+
+-- SPA checks view
+CREATE VIEW IF NOT EXISTS view_spa_checks AS
+SELECT
+    base_domain,
+    checked_at,
+    random_404_url,
+    random_404_status,
+    random_404_final_url,
+    random_404_ok,
+    case_url,
+    case_status,
+    case_final_url,
+    case_redirects,
+    case_canonical_url,
+    case_expected_url,
+    case_ok,
+    notes
+FROM spa_checks;
+
+-- General checks view (latest per domain)
+CREATE VIEW IF NOT EXISTS view_crawl_general_checks AS
+WITH latest_hsts AS (
+    SELECT h.*
+    FROM hsts_preload_checks h
+    JOIN (
+        SELECT base_domain, MAX(checked_at) AS checked_at
+        FROM hsts_preload_checks
+        GROUP BY base_domain
+    ) latest ON latest.base_domain = h.base_domain AND latest.checked_at = h.checked_at
+),
+latest_spa AS (
+    SELECT s.*
+    FROM spa_checks s
+    JOIN (
+        SELECT base_domain, MAX(checked_at) AS checked_at
+        FROM spa_checks
+        GROUP BY base_domain
+    ) latest ON latest.base_domain = s.base_domain AND latest.checked_at = s.checked_at
+)
+SELECT
+    COALESCE(h.base_domain, s.base_domain) AS base_domain,
+    h.checked_at AS hsts_checked_at,
+    h.eligible AS hsts_preload_eligible,
+    h.https_status AS hsts_https_status,
+    h.http_status AS hsts_http_status,
+    h.hsts_header,
+    h.hsts_max_age,
+    h.hsts_include_subdomains,
+    h.hsts_preload,
+    h.hsts_max_age_ok,
+    h.http_redirects_to_https,
+    h.http_redirect_target,
+    s.checked_at AS spa_checked_at,
+    s.random_404_status,
+    s.random_404_ok,
+    s.random_404_final_url,
+    s.case_status,
+    s.case_ok,
+    s.case_final_url,
+    s.case_canonical_url,
+    h.notes AS hsts_notes,
+    s.notes AS spa_notes
+FROM latest_hsts h
+FULL OUTER JOIN latest_spa s ON s.base_domain = h.base_domain;
 """
 
 # PostgreSQL database views (simplified versions)
@@ -767,6 +852,85 @@ SELECT
     MAX(f.updated_at) as last_updated
 FROM frontier f
 GROUP BY f.status;
+
+-- HSTS preload checks view (PostgreSQL version)
+CREATE OR REPLACE VIEW view_hsts_preload_checks AS
+SELECT
+    base_domain,
+    checked_at,
+    https_url,
+    https_status,
+    hsts_header,
+    hsts_max_age,
+    hsts_include_subdomains,
+    hsts_preload,
+    hsts_max_age_ok,
+    http_url,
+    http_status,
+    http_redirects_to_https,
+    http_redirect_target,
+    eligible,
+    notes
+FROM hsts_preload_checks;
+
+-- SPA checks view (PostgreSQL version)
+CREATE OR REPLACE VIEW view_spa_checks AS
+SELECT
+    base_domain,
+    checked_at,
+    random_404_url,
+    random_404_status,
+    random_404_final_url,
+    random_404_ok,
+    case_url,
+    case_status,
+    case_final_url,
+    case_redirects,
+    case_canonical_url,
+    case_expected_url,
+    case_ok,
+    notes
+FROM spa_checks;
+
+-- General checks view (PostgreSQL version, latest per domain)
+CREATE OR REPLACE VIEW view_crawl_general_checks AS
+WITH latest_hsts AS (
+    SELECT DISTINCT ON (base_domain)
+        h.*
+    FROM hsts_preload_checks h
+    ORDER BY base_domain, checked_at DESC
+),
+latest_spa AS (
+    SELECT DISTINCT ON (base_domain)
+        s.*
+    FROM spa_checks s
+    ORDER BY base_domain, checked_at DESC
+)
+SELECT
+    COALESCE(h.base_domain, s.base_domain) AS base_domain,
+    h.checked_at AS hsts_checked_at,
+    h.eligible AS hsts_preload_eligible,
+    h.https_status AS hsts_https_status,
+    h.http_status AS hsts_http_status,
+    h.hsts_header,
+    h.hsts_max_age,
+    h.hsts_include_subdomains,
+    h.hsts_preload,
+    h.hsts_max_age_ok,
+    h.http_redirects_to_https,
+    h.http_redirect_target,
+    s.checked_at AS spa_checked_at,
+    s.random_404_status,
+    s.random_404_ok,
+    s.random_404_final_url,
+    s.case_status,
+    s.case_ok,
+    s.case_final_url,
+    s.case_canonical_url,
+    h.notes AS hsts_notes,
+    s.notes AS spa_notes
+FROM latest_hsts h
+FULL OUTER JOIN latest_spa s ON s.base_domain = h.base_domain;
 """
 
 
